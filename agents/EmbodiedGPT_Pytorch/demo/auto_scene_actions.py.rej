@@ -1,0 +1,46 @@
+--- agents/EmbodiedGPT_Pytorch/demo/auto_scene_actions.py.orig
++++ agents/EmbodiedGPT_Pytorch/demo/auto_scene_actions.py
+@@ -5143,25 +5143,40 @@
+ def deterministic_structured_interaction_action(
+     args: argparse.Namespace, step: dict[str, Any], observation: dict[str, Any],
+ ) -> dict[str, Any] | None:
+     pickup_action = deterministic_structured_pickup_action(args, step, observation)
+     if pickup_action is not None:
+         return pickup_action
+     if task_intent_source_for_args(args) != "upstream_structured_task":
+         return None
+     action_name = step.get("action")
+-    if action_name not in TOGGLEABLE_ACTIONS:
++    wanted_object_id = step.get("objectId")
++    if action_name in OPENABLE_ACTIONS:
++        if not isinstance(wanted_object_id, str) or not wanted_object_id:
++            return None
++        role = "openable"
++    elif action_name in TOGGLEABLE_ACTIONS:
++        role = "toggleable"
++    else:
+         return None
+     objects = observation.get("objects")
+     if not isinstance(objects, list):
+         return None
+     try:
+         target = select_object(
+-            objects, step.get("objectType"), role="toggleable", allow_invisible=False,
+-            action_name=action_name, wanted_object_id=step.get("objectId"),
++            objects, step.get("objectType"), role=role, allow_invisible=False,
++            action_name=action_name, wanted_object_id=wanted_object_id,
+         )
+     except ValueError:
+         return None
+     target_object_id = object_id_of(target)
+     if not target_object_id:
+         return None
++    if action_name in OPENABLE_ACTIONS:
++        is_open = _object_open_state(target)
++        if not isinstance(is_open, bool):
++            return None
++        if action_name == "OpenObject" and is_open:
++            return None
++        if action_name == "CloseObject" and not is_open:
++            return None
+     return {"action": action_name, "objectId": target_object_id, "forceAction": True}

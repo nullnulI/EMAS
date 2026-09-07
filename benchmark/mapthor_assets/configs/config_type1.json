@@ -1,0 +1,255 @@
+{
+  "tasks": [
+    {
+      "task_name": "1_put_bread_lettuce_tomato_fridge",
+      "task_description": "Put the bread, lettuce, and tomato in the fridge",
+      "task_id": 1,
+      "task_type": "transport",
+      "task_complexity": "simple",
+      "task_timeout": 30,
+      "task_floorplans": [
+        "FloorPlan1",
+        "FloorPlan2",
+        "FloorPlan3",
+        "FloorPlan4",
+        "FloorPlan5"
+      ],
+      "task_checklist": [
+        "NavigateTo(Bread)",
+        "PickupObject(Bread)",
+        "NavigateTo(Fridge, Bread)",
+        "PutObject(Fridge, Bread)",
+        "NavigateTo(Tomato)",
+        "PickupObject(Tomato)",
+        "NavigateTo(Fridge, Tomato)",
+        "PutObject(Fridge, Tomato)",
+        "NavigateTo(Lettuce)",
+        "PickupObject(Lettuce)",
+        "NavigateTo(Fridge, Lettuce)",
+        "PutObject(Fridge, Lettuce)",
+        "OpenObject(Fridge)",
+        "CloseObject(Fridge)"
+      ]
+    },
+    {
+      "task_name": "1_put_computer_book_remotecontrol_sofa",
+      "task_description": "Put the computer, book, and remotecontrol on the sofa",
+      "task_id": 2,
+      "task_type": "transport",
+      "task_complexity": "simple",
+      "task_timeout": 30,
+      "task_floorplans": [
+        "FloorPlan201",
+        "FloorPlan202",
+        "FloorPlan203",
+        "FloorPlan209",
+        "FloorPlan224"
+      ],
+      "task_checklist": [
+        "NavigateTo(Laptop)",
+        "PickObject(Laptop)",
+        "NavigateTo(Sofa, Laptop)",
+        "PutObject(Sofa, Laptop)",
+        "NavigateTo(RemoteControl)",
+        "PickObject(RemoteControl)",
+        "NavigateTo(Sofa, RemoteControl)",
+        "PutObject(Sofa, RemoteControl)",
+        "NavigateTo(Book)",
+        "PickObject(Book)",
+        "NavigateTo(Sofa, Book)",
+        "PutObject(Sofa, Book)"
+      ]
+    },
+    {
+      "task_name": "1_put_knife_bowl_mug_countertop",
+      "task_description": "Put the butter knife, bowl, and mug on the countertop",
+      "task_id": 3,
+      "task_type": "transport",
+      "task_complexity": "simple",
+      "task_timeout": 30,
+      "task_floorplans": [
+        "FloorPlan1",
+        "FloorPlan2",
+        "FloorPlan3",
+        "FloorPlan4",
+        "FloorPlan5"
+      ],
+      "task_checklist": [
+        "NavigateTo(ButterKnife)",
+        "PickupObject(ButterKnife)",
+        "NavigateTo(CounterTop, ButterKnife)",
+        "PutObject(CounterTop, ButterKnife)",
+        "NavigateTo(Bowl)",
+        "PickupObject(Bowl)",
+        "NavigateTo(CounterTop, Bowl)",
+        "PutObject(CounterTop, Bowl)",
+        "NavigateTo(Mug)",
+        "PickupObject(Mug)",
+        "NavigateTo(CounterTop, Mug)",
+        "PutObject(CounterTop, Mug)"
+      ]
+    },
+    {
+      "task_name": "1_put_plate_mug_bowl_fridge",
+      "task_description": "Put the plate, mug, and bowl in the fridge",
+      "task_id": 4,
+      "task_type": "transport",
+      "task_complexity": "simple",
+      "task_timeout": 30,
+      "task_floorplans": [
+        "FloorPlan1",
+        "FloorPlan2",
+        "FloorPlan3",
+        "FloorPlan4",
+        "FloorPlan5"
+      ],
+      "task_checklist": [
+        "NavigateTo(Plate)",
+        "PickupObject(Plate)",
+        "NavigateTo(Fridge, Plate)",
+        "PutObject(Fridge, Plate)",
+        "NavigateTo(Mug)",
+        "PickupObject(Mug)",
+        "NavigateTo(Fridge, Mug)",
+        "PutObject(Fridge, Mug)",
+        "NavigateTo(Bowl)",
+        "PickupObject(Bowl)",
+        "NavigateTo(Fridge, Bowl)",
+        "PutObject(Fridge, Bowl)",
+        "OpenObject(Fridge)",
+        "CloseObject(Fridge)"
+      ]
+    },
+    {
+      "task_name": "1_put_remotecontrol_keys_watch_box",
+      "task_description": "Put the remotecontrol, keys, and watch in the box",
+      "task_id": 5,
+      "task_type": "transport",
+      "task_complexity": "simple",
+      "task_timeout": 30,
+      "task_floorplans": [
+        "FloorPlan201",
+        "FloorPlan202",
+        "FloorPlan207",
+        "FloorPlan209",
+        "FloorPlan215",
+        "FloorPlan226",
+        "FloorPlan228"
+      ],
+      "task_checklist": [
+        "NavigateTo(RemoteControl)",
+        "PickupObject(RemoteControl)",
+        "NavigateTo(Box, RemoteControl)",
+        "PutObject(Box, RemoteControl)",
+        "NavigateTo(KeyChain)",
+        "PickupObject(KeyChain)",
+        "NavigateTo(Box, KeyChain)",
+        "PutObject(Box, KeyChain)",
+        "NavigateTo(Watch)",
+        "PickupObject(Watch)",
+        "NavigateTo(Box, Watch)",
+        "PutObject(Box, Watch)"
+      ]
+    },
+    {
+      "task_name": "1_put_vase_tissuebox_remotecontrol_table",
+      "task_description": "Put the vase, tissue box, and remote control on the table",
+      "task_id": 6,
+      "task_type": "transport",
+      "task_complexity": "simple",
+      "task_timeout": 30,
+      "task_floorplans": [
+        "FloorPlan201",
+        "FloorPlan203",
+        "FloorPlan216",
+        "FloorPlan219",
+        "FloorPlan229"
+      ],
+      "task_checklist": [
+        "NavigateTo(Vase)",
+        "PickupObject(Vase)",
+        "NavigateTo(Table, Vase)",
+        "PutObject(Table, Vase)",
+        "NavigateTo(TissueBox)",
+        "PickupObject(TissueBox)",
+        "NavigateTo(Table, TissueBox)",
+        "PutObject(Table, TissueBox)",
+        "NavigateTo(RemoteControl)",
+        "PickupObject(RemoteControl)",
+        "NavigateTo(Table, RemoteControl)",
+        "PutObject(Table, RemoteControl)"
+      ]
+    },
+    {
+      "task_name": "1_slice_bread_lettuce_tomato_egg",
+      "task_description": "Slice the bread, lettuce, tomato, and egg",
+      "task_id": 7,
+      "task_type": "manipulation",
+      "task_complexity": "simple",
+      "task_timeout": 30,
+      "task_floorplans": [
+        "FloorPlan1",
+        "FloorPlan2",
+        "FloorPlan3",
+        "FloorPlan4",
+        "FloorPlan5"
+      ],
+      "task_checklist": [
+        "NavigateTo(Bread)",
+        "SliceObject(Bread)",
+        "NavigateTo(Tomato)",
+        "SliceObject(Tomato)",
+        "NavigateTo(Egg)",
+        "SliceObject(Egg)",
+        "NavigateTo(Lettuce)",
+        "SliceObject(Lettuce)"
+      ]
+    },
+    {
+      "task_name": "1_turn_off_faucet_light",
+      "task_description": "Turn off the faucet and light if either is on",
+      "task_id": 8,
+      "task_type": "manipulation",
+      "task_complexity": "simple",
+      "task_timeout": 30,
+      "task_floorplans": [
+        "FloorPlan1",
+        "FloorPlan2",
+        "FloorPlan3",
+        "FloorPlan4",
+        "FloorPlan5"
+      ],
+      "task_checklist": [
+        "NavigateTo(Faucet)",
+        "ToggleObjectOff(Faucet)",
+        "NavigateTo(LightSwitch)",
+        "ToggleObjectOff(LightSwitch)"
+      ]
+    },
+    {
+      "task_name": "1_wash_bowl_mug_pot_pan",
+      "task_description": "Wash the bowl, mug, pot, and pan",
+      "task_id": 9,
+      "task_type": "manipulation",
+      "task_complexity": "simple",
+      "task_timeout": 30,
+      "task_floorplans": [
+        "FloorPlan1",
+        "FloorPlan2",
+        "FloorPlan3",
+        "FloorPlan4",
+        "FloorPlan5"
+      ],
+      "task_checklist": [
+        "NavigateTo(Bowl)",
+        "CleanObject(Bowl)",
+        "NavigateTo(Mug)",
+        "CleanObject(Mug)",
+        "NavigateTo(Pan)",
+        "CleanObject(Pan)",
+        "NavigateTo(Pot)",
+        "CleanObject(Pot)"
+      ]
+    }
+  ]
+}

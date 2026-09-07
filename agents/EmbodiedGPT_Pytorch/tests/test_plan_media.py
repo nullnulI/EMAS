@@ -1,0 +1,5179 @@
+from __future__ import annotations
+
+import contextlib
+import io
+import json
+import tempfile
+import threading
+import unittest
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
+import sys
+from types import SimpleNamespace
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from demo import auto_scene_actions as auto_scene_actions_module
+from demo.auto_scene_actions import (
+    add_execute_response_result,
+    already_satisfied_observation_for_step,
+    agent_observations_summary,
+    build_object_visibility_map,
+    choose_relay_executor,
+    coordination_result_for_plan,
+    execute_extract_task_intent_tool,
+    execute_response_failure_reason,
+    execution_state_changes_from_response,
+    evaluate_relay_executor_candidates,
+    expand_put_object_intent_preconditions,
+    expand_slice_object_intent_preconditions,
+    extract_agent_observations,
+    extract_requested_action,
+    extract_requested_object_type,
+    generate_semantic_plan,
+    ground_semantic_plan,
+    held_object_debug_from_observation,
+    held_object_type_from_observation,
+    merge_execute_result_into_observation,
+    parse_qwen_tool_call,
+    object_visibility_summary,
+    pickup_step_already_satisfied,
+    prune_already_satisfied_semantic_steps,
+    object_state_step_already_satisfied,
+    relay_result_for_held_put_step,
+    repair_semantic_placeholders_from_step_intent,
+    repair_redundant_pickup_for_held_put,
+    save_qwen_raw_output,
+    summarize_execute_response,
+    validate_action_affordances,
+    validate_action_intent_consistency,
+    validate_action_state_preconditions,
+    validate_goal_consistency,
+    validate_intent_steps_consistency,
+    validate_put_object_goal_consistency,
+    validate_executor_plan_or_failure,
+    validate_task_intent_consistency,
+    validate_task_intent_tool_call,
+)
+
+
+class SafeActionPayloadTest(unittest.TestCase):
+    def test_safe_action_args_reach_controller_payload(self):
+        objects = [{
+            "id": "Mug|1",
+            "type": "Mug",
+            "visible": True,
+            "pickupable": True,
+            "moveable": True,
+            "canFillWithLiquid": True,
+        }]
+        cases = [
+            (
+                {"action": "PushObject", "objectType": "Mug", "actionArgs": {"moveMagnitude": 200}},
+                {"action": "PushObject", "objectId": "Mug|1", "forceAction": True, "moveMagnitude": 200.0},
+            ),
+            (
+                {"action": "FillObjectWithLiquid", "objectType": "Mug", "actionArgs": {"fillLiquid": "water"}},
+                {"action": "FillObjectWithLiquid", "objectId": "Mug|1", "forceAction": True, "fillLiquid": "water"},
+            ),
+            (
+                {"action": "MoveHeldObject", "objectType": "Mug", "actionArgs": {"right": 0.1}},
+                {"action": "MoveHeldObject", "right": 0.1, "up": 0.0, "ahead": 0.0},
+            ),
+            (
+                {"action": "DropHandObject", "objectType": "Mug"},
+                {"action": "DropHandObject"},
+            ),
+        ]
+        for step, expected in cases:
+            with self.subTest(action=step["action"]):
+                self.assertEqual(
+                    auto_scene_actions_module.grounded_action_for_step(
+                        step, objects, allow_invisible=False
+                    ),
+                    expected,
+                )
+from demo.plan_media import (
+    build_execution_payload,
+    parse_args,
+    parse_native_planning_output,
+    parse_semantic_planning_output,
+    question_prompt,
+    native_planning_prompt,
+    semantic_planning_prompt,
+    plan_only_document,
+    send_actions,
+)
+
+
+def fake_task_intent_tool_call(args, available_types):
+    tool_call = {"name": "extract_task_intent", "arguments": {"task": args.task}}
+    return (
+        tool_call,
+        execute_extract_task_intent_tool(args.task, available_types),
+        validate_task_intent_tool_call(tool_call, args.task),
+    )
+
+
+def test_slice_expansion_opens_tool_receptacle_and_picks_up_knife():
+    task_intent = {
+        "requestedAction": "GotoObject",
+        "requestedObjectType": "Tomato",
+        "intentSteps": [
+            {"order": 1, "action": "GotoObject", "objectType": "Tomato", "targetType": None},
+            {"order": 2, "action": "SliceObject", "objectType": "Tomato", "targetType": None},
+        ],
+    }
+    observation = {
+        "objects": [
+            {
+                "objectId": "Knife|1",
+                "objectType": "Knife",
+                "visible": False,
+                "parentReceptacles": ["Drawer|1"],
+            },
+            {
+                "objectId": "Drawer|1",
+                "objectType": "Drawer",
+                "openable": True,
+                "isOpen": False,
+            },
+            {"objectId": "Tomato|1", "objectType": "Tomato", "visible": True},
+        ],
+        "inventory": [],
+    }
+
+    warnings = expand_slice_object_intent_preconditions(task_intent, observation)
+
+    assert [step["action"] for step in task_intent["intentSteps"]] == [
+        "GotoObject", "OpenObject", "GotoObject", "PickupObject", "GotoObject", "SliceObject"
+    ]
+    assert task_intent["intentSteps"][0]["objectType"] == "Drawer"
+    assert task_intent["intentSteps"][2]["objectType"] == "Knife"
+    assert any("closed receptacle" in warning for warning in warnings)
+
+
+def test_slice_expansion_does_not_receive_peer_inventory_as_local_state():
+    task_intent = {
+        "intentSteps": [
+            {"order": 1, "action": "SliceObject", "objectType": "Lettuce"},
+        ],
+    }
+    observation = {
+        "robot_id": 1,
+        "objects": [
+            {
+                "objectId": "Knife|1",
+                "objectType": "Knife",
+                "visible": True,
+                "pickupable": True,
+            },
+            {
+                "objectId": "Lettuce|1",
+                "objectType": "Lettuce",
+                "visible": True,
+                "sliceable": True,
+            },
+        ],
+        "inventory": [],
+    }
+
+    expand_slice_object_intent_preconditions(
+        task_intent,
+        observation,
+        known_held_object_types=["ButterKnife"],
+    )
+
+    assert [step["action"] for step in task_intent["intentSteps"]][:2] == [
+        "GotoObject",
+        "PickupObject",
+    ]
+    assert task_intent["intentSteps"][1]["objectType"] == "Knife"
+
+
+def test_required_tool_candidates_prioritize_holder_and_exclude_failed_robot():
+    semantic_plan = {
+        "plan": [{"action": "SliceObject", "objectType": "Lettuce"}],
+    }
+    task_intent = {
+        "requestedAction": "SliceObject",
+        "requestedObjectType": "Lettuce",
+        "intentSteps": [{"action": "SliceObject", "objectType": "Lettuce"}],
+    }
+    target = {
+        "objectId": "Lettuce|1",
+        "objectType": "Lettuce",
+        "visible": True,
+        "sliceable": True,
+        "position": {"x": 0, "y": 0, "z": 0},
+    }
+    observations = [
+        {
+            "agent_id": "0",
+            "robot_id": 0,
+            "is_primary": False,
+            "objects": [dict(target)],
+            "held_object": {
+                "objectId": "ButterKnife|1",
+                "objectType": "ButterKnife",
+            },
+            "inventory": [{"objectId": "ButterKnife|1", "objectType": "ButterKnife"}],
+        },
+        {
+            "agent_id": "1",
+            "robot_id": 1,
+            "is_primary": True,
+            "objects": [
+                dict(target),
+                {
+                    "objectId": "Knife|1",
+                    "objectType": "Knife",
+                    "visible": True,
+                    "pickupable": True,
+                },
+            ],
+            "inventory": [],
+        },
+    ]
+
+    evaluation = evaluate_relay_executor_candidates(
+        "slice the lettuce",
+        semantic_plan,
+        task_intent,
+        build_object_visibility_map(observations),
+        observations,
+        [0, 1],
+        1,
+    )
+    assert evaluation["candidate_executor_robot_ids"] == [0, 1]
+    assert evaluation["candidate_scores"][0]["holds_required_tool"] is True
+
+    excluded = evaluate_relay_executor_candidates(
+        "slice the lettuce",
+        semantic_plan,
+        task_intent,
+        build_object_visibility_map(observations),
+        observations,
+        [0, 1],
+        1,
+        excluded_robot_ids={0},
+    )
+    assert excluded["candidate_executor_robot_ids"] == [1]
+    failed_holder = next(item for item in excluded["candidate_scores"] if item["robot_id"] == 0)
+    assert failed_holder["excluded_after_failed_attempt"] is True
+    assert failed_holder["executable"] is False
+
+
+def test_slice_state_validation_requires_cutting_tool():
+    plan = {"plan": [{"action": "SliceObject", "objectType": "Tomato"}]}
+
+    try:
+        validate_action_state_preconditions(plan, {"objects": [], "inventory": []}, allow_invisible=False)
+    except ValueError as exc:
+        assert "not a cutting tool" in str(exc)
+    else:
+        raise AssertionError("SliceObject without a cutting tool must be rejected")
+
+    held = validate_action_state_preconditions(
+        plan,
+        {"objects": [], "held_object": {"objectType": "Knife", "objectId": "Knife|1"}},
+        allow_invisible=False,
+    )
+    assert held == "Knife"
+
+
+def test_goto_instance_binding_drives_exact_compound_intent_actions():
+    drawer_b = "Drawer|+00.81|+00.48|-01.16"
+    steps = [
+        {"order": 1, "action": "GotoObject", "objectType": "Drawer"},
+        {"order": 2, "action": "OpenObject", "objectType": "Drawer"},
+        {"order": 3, "action": "PickupObject", "objectType": "Drawer"},
+        {"order": 4, "action": "PutObject", "objectType": "Drawer", "targetType": "CounterTop"},
+        {"order": 5, "action": "PutObject", "objectType": "Fork", "targetType": "Drawer"},
+        {"order": 6, "action": "CloseObject", "objectType": "Drawer"},
+    ]
+
+    bindings = auto_scene_actions_module.propagate_goto_instance_binding(
+        steps,
+        goto_step_index=0,
+        object_id=drawer_b,
+    )
+
+    assert steps[0]["objectId"] == drawer_b
+    assert steps[1]["objectId"] == drawer_b
+    assert steps[2]["objectId"] == drawer_b
+    assert steps[3]["objectId"] == drawer_b
+    assert steps[4]["targetObjectId"] == drawer_b
+    assert steps[5]["objectId"] == drawer_b
+    assert {(item["step_index"], item["field"]) for item in bindings} == {
+        (1, "objectId"),
+        (2, "objectId"),
+        (3, "objectId"),
+        (4, "objectId"),
+        (5, "targetObjectId"),
+        (6, "objectId"),
+    }
+
+    action = auto_scene_actions_module.deterministic_structured_interaction_action(
+        SimpleNamespace(_task_intent_source="upstream_structured_task"),
+        steps[1],
+        {
+            "objects": [
+                {
+                    "objectId": "Drawer|+01.50|+00.63|-00.02",
+                    "objectType": "Drawer",
+                    "visible": True,
+                    "openable": True,
+                    "isOpen": False,
+                    "distance": 0.2,
+                },
+                {
+                    "objectId": drawer_b,
+                    "objectType": "Drawer",
+                    "visible": True,
+                    "openable": True,
+                    "isOpen": False,
+                    "distance": 0.8,
+                },
+            ],
+            "inventory": [],
+        },
+    )
+    assert action == {"action": "OpenObject", "objectId": drawer_b, "forceAction": True}
+
+
+def test_goto_instance_binding_stops_at_explicit_instance_boundary():
+    steps = [
+        {"order": 1, "action": "GotoObject", "objectType": "Drawer"},
+        {
+            "order": 2,
+            "action": "OpenObject",
+            "objectType": "Drawer",
+            "objectId": "Drawer|explicit",
+        },
+        {"order": 3, "action": "CloseObject", "objectType": "Drawer"},
+    ]
+
+    auto_scene_actions_module.propagate_goto_instance_binding(
+        steps,
+        goto_step_index=0,
+        object_id="Drawer|goto",
+    )
+
+    assert steps[0]["objectId"] == "Drawer|goto"
+    assert steps[1]["objectId"] == "Drawer|explicit"
+    assert "objectId" not in steps[2]
+
+
+class ParseNativePlanTest(unittest.TestCase):
+    def test_returns_executable_plan(self) -> None:
+        plan = [
+            {"action": "PickupObject", "objectId": "Apple|UNKNOWN"},
+            {"action": "RotateRight"},
+        ]
+        output = json.dumps({"task": "move an apple", "plan": plan})
+
+        self.assertEqual(parse_native_planning_output(output)["plan"], plan)
+
+    def test_rejects_legacy_top_level_actions(self) -> None:
+        output = json.dumps({"task": "move", "actions": [{"action": "MoveAhead"}]})
+        with self.assertRaisesRegex(ValueError, "top-level"):
+            parse_native_planning_output(output)
+
+    def test_rejects_missing_plan(self) -> None:
+        with self.assertRaisesRegex(ValueError, "plan"):
+            parse_native_planning_output(json.dumps({"task": "x"}))
+
+    def test_rejects_empty_plan(self) -> None:
+        with self.assertRaisesRegex(ValueError, "non-empty"):
+            parse_native_planning_output(json.dumps({"task": "x", "plan": []}))
+
+    def test_rejects_non_list_plan(self) -> None:
+        with self.assertRaisesRegex(ValueError, "plan"):
+            parse_native_planning_output(json.dumps({"task": "x", "plan": {"action": "MoveAhead"}}))
+
+    def test_rejects_non_object_plan_item(self) -> None:
+        with self.assertRaisesRegex(ValueError, "must be an object"):
+            parse_native_planning_output(json.dumps({"task": "x", "plan": ["MoveAhead"]}))
+
+    def test_rejects_missing_action_name(self) -> None:
+        with self.assertRaisesRegex(ValueError, "action"):
+            parse_native_planning_output(json.dumps({"task": "x", "plan": [{"objectId": "Apple|UNKNOWN"}]}))
+
+    def test_rejects_invalid_json(self) -> None:
+        with self.assertRaisesRegex(ValueError, "valid JSON"):
+            parse_native_planning_output("Plan: 1. MoveAhead")
+
+    def test_plan_only_document_contains_no_actions_key(self) -> None:
+        plan = [{"action": "MoveAhead"}]
+        self.assertEqual(plan_only_document(plan), {"plan": plan})
+
+    def test_plan_only_replaces_actions_only_cli(self) -> None:
+        args = parse_args(["--media", "scene.jpg", "--plan-only"])
+        self.assertTrue(args.plan_only)
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                parse_args(["--media", "scene.jpg", "--actions-only"])
+
+
+class SendActionsTest(unittest.TestCase):
+    def test_maps_plan_to_actions_at_http_boundary(self) -> None:
+        captured = {}
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:  # noqa: N802
+                length = int(self.headers.get("Content-Length", "0"))
+                captured["content_type"] = self.headers.get("Content-Type")
+                captured["body"] = self.rfile.read(length).decode("utf-8")
+                self.send_response(204)
+                self.end_headers()
+
+            def log_message(self, format: str, *args: object) -> None:
+                return
+
+        server = HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.handle_request)
+        thread.start()
+        try:
+            plan = [
+                {"action": "MoveAhead"},
+                {"action": "PickupObject", "objectId": "Apple|UNKNOWN"},
+            ]
+            parsed = {"task": "move an apple", "plan": plan}
+            payload = build_execution_payload(parsed, "task-1")
+            send_actions(f"http://127.0.0.1:{server.server_port}/actions", payload, 2.0)
+        finally:
+            thread.join(timeout=5)
+            server.server_close()
+
+        self.assertIn("application/json", captured["content_type"])
+        body = json.loads(captured["body"])
+        self.assertEqual(body["task_id"], "task-1")
+        self.assertEqual(body["task"], "move an apple")
+        self.assertEqual(body["plan"], plan)
+        self.assertIs(body["stop_on_failure"], False)
+        self.assertEqual(body["actions"], plan)
+
+
+class AutoSceneActionsOutputTest(unittest.TestCase):
+    def test_default_execute_response_is_summarized_not_included(self) -> None:
+        result: dict[str, object] = {}
+        response_text = json.dumps(
+            {
+                "success": True,
+                "state": {
+                    "sceneName": "FloorPlan1",
+                    "objects": [{"id": "Egg|1"}, {"id": "Fridge|1"}],
+                },
+                "message": "ok",
+            }
+        )
+
+        add_execute_response_result(
+            result,
+            response_text,
+            include_response=False,
+            save_response=False,
+            output_dir=Path("/tmp"),
+            task_id="task-1",
+            action_count=2,
+        )
+
+        self.assertNotIn("execute_response", result)
+        self.assertEqual(result["execute_response_summary"]["success"], True)
+        self.assertEqual(result["execute_response_summary"]["sceneName"], "FloorPlan1")
+        self.assertEqual(result["execute_response_summary"]["object_count"], 2)
+        self.assertNotIn('"objects"', json.dumps(result["execute_response_summary"]))
+
+    def test_include_execute_response_keeps_full_response(self) -> None:
+        result: dict[str, object] = {}
+        response = {"success": True, "state": {"objects": [{"id": "Egg|1"}]}}
+
+        add_execute_response_result(
+            result,
+            json.dumps(response),
+            include_response=True,
+            save_response=False,
+            output_dir=Path("/tmp"),
+            task_id="task-1",
+            action_count=1,
+        )
+
+        self.assertEqual(result["execute_response"], response)
+        self.assertIn("execute_response_summary", result)
+
+    def test_save_response_and_raw_output_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir)
+            result: dict[str, object] = {}
+            response_text = json.dumps({"success": True, "state": {"objects": []}})
+
+            raw_path = save_qwen_raw_output(output_dir, "task-1", "raw qwen json")
+            add_execute_response_result(
+                result,
+                response_text,
+                include_response=False,
+                save_response=True,
+                output_dir=output_dir,
+                task_id="task-1",
+                action_count=1,
+            )
+
+            self.assertEqual(Path(raw_path).read_text(encoding="utf-8"), "raw qwen json")
+            response_path = Path(result["execute_response_path"])
+            self.assertEqual(response_path.read_text(encoding="utf-8"), response_text)
+            self.assertTrue(response_path.name.endswith("_execute_response.json"))
+
+    def test_execute_response_summary_truncates_text_response(self) -> None:
+        summary = summarize_execute_response("x" * 600, action_count=3)
+
+        self.assertEqual(summary["response_type"], "str")
+        self.assertEqual(summary["action_count"], 3)
+        self.assertLess(len(summary["text_preview"]), 510)
+
+    def test_execute_response_failure_reason_detects_failed_status(self) -> None:
+        self.assertIn("failed", execute_response_failure_reason({"status": "failed"}))
+
+    def test_execute_response_failure_reason_detects_failed_result(self) -> None:
+        reason = execute_response_failure_reason(
+            {"status": "success", "results": [{"action": "PickupObject", "success": False, "error": "not reachable"}]}
+        )
+
+        self.assertIn("PickupObject", reason)
+        self.assertIn("not reachable", reason)
+
+
+class ExecutionStateChangesTest(unittest.TestCase):
+    def test_open_close_object_changes_preserve_state(self) -> None:
+        response = {
+            "status": "success",
+            "results": [
+                {
+                    "index": 0,
+                    "action": "OpenObject",
+                    "robot_id": 0,
+                    "success": True,
+                    "interacted_objects": [
+                        {
+                            "objectId": "Fridge|-02.10|+00.00|+01.07",
+                            "type": "Fridge",
+                            "before": {"objectId": "Fridge|-02.10|+00.00|+01.07", "objectType": "Fridge", "isOpen": False},
+                            "after": {"objectId": "Fridge|-02.10|+00.00|+01.07", "objectType": "Fridge", "isOpen": True, "position": {"x": -2.1, "y": 0.0, "z": 1.07}},
+                            "state_changed": True,
+                        }
+                    ],
+                },
+                {
+                    "index": 1,
+                    "action": "CloseObject",
+                    "robot_id": 0,
+                    "success": True,
+                    "interacted_objects": [
+                        {
+                            "objectId": "Fridge|-02.10|+00.00|+01.07",
+                            "type": "Fridge",
+                            "before": {"objectId": "Fridge|-02.10|+00.00|+01.07", "objectType": "Fridge", "isOpen": True},
+                            "after": {"objectId": "Fridge|-02.10|+00.00|+01.07", "objectType": "Fridge", "isOpen": False},
+                            "state_changed": True,
+                        }
+                    ],
+                },
+            ],
+        }
+
+        changes = execution_state_changes_from_response(response)
+
+        self.assertEqual([item["source_action"] for item in changes["object_changes"]], ["OpenObject", "CloseObject"])
+        self.assertIs(changes["object_changes"][0]["isOpen"], True)
+        self.assertIs(changes["object_changes"][1]["isOpen"], False)
+        self.assertEqual(changes["object_changes"][0]["position"], {"x": -2.1, "y": 0.0, "z": 1.07})
+
+    def test_pickup_put_generate_object_and_inventory_changes(self) -> None:
+        tomato_id = "Tomato|-00.50|+01.00|+00.25"
+        response = {
+            "status": "success",
+            "results": [
+                {
+                    "index": 0,
+                    "action": "PickupObject",
+                    "robot_id": 0,
+                    "success": True,
+                    "inventory": [{"objectId": tomato_id, "objectType": "Tomato"}],
+                    "held_object": {"objectId": tomato_id, "objectType": "Tomato"},
+                    "interacted_objects": [
+                        {
+                            "objectId": tomato_id,
+                            "after": {"objectId": tomato_id, "objectType": "Tomato", "inInventory": True},
+                            "state_changed": True,
+                        }
+                    ],
+                },
+                {
+                    "index": 1,
+                    "action": "PutObject",
+                    "robot_id": 0,
+                    "success": True,
+                    "inventory": [],
+                    "held_object": None,
+                    "interacted_objects": [
+                        {
+                            "objectId": tomato_id,
+                            "after": {
+                                "objectId": tomato_id,
+                                "objectType": "Tomato",
+                                "position": {"x": 0.5, "y": 0.95, "z": -2.0},
+                                "parentReceptacles": ["CounterTop|+00.50|+00.95|-02.00"],
+                            },
+                            "state_changed": True,
+                        }
+                    ],
+                },
+            ],
+        }
+
+        changes = execution_state_changes_from_response(response)
+
+        self.assertEqual([item["source_action"] for item in changes["object_changes"]], ["PickupObject", "PutObject"])
+        self.assertIs(changes["object_changes"][0]["inInventory"], True)
+        self.assertEqual(changes["object_changes"][1]["parentReceptacles"], ["CounterTop|+00.50|+00.95|-02.00"])
+        self.assertEqual([item["source_action"] for item in changes["inventory_changes"]], ["PickupObject", "PutObject"])
+        self.assertEqual(changes["inventory_changes"][1]["inventory"], [])
+
+    def test_navigation_and_view_actions_generate_robot_changes_only(self) -> None:
+        response = {
+            "status": "success",
+            "results": [
+                {
+                    "index": 0,
+                    "action": "MoveAhead",
+                    "robot_id": 1,
+                    "success": True,
+                    "robot_pose_changed": True,
+                    "robot_pose_delta": {
+                        "before": {"position": {"x": 0.0, "y": 0.9, "z": 0.0}, "rotation": {"y": 0.0}, "horizon": 0.0},
+                        "after": {"position": {"x": 0.0, "y": 0.9, "z": 0.25}, "rotation": {"y": 0.0}, "horizon": 0.0},
+                    },
+                },
+                {
+                    "index": 1,
+                    "action": "LookDown",
+                    "robot_id": 1,
+                    "success": True,
+                    "robot_pose_changed": True,
+                    "robot_pose_delta": {
+                        "before": {"position": {"x": 0.0, "y": 0.9, "z": 0.25}, "rotation": {"y": 0.0}, "horizon": 0.0},
+                        "after": {"position": {"x": 0.0, "y": 0.9, "z": 0.25}, "rotation": {"y": 0.0}, "horizon": 30.0},
+                    },
+                },
+            ],
+        }
+
+        changes = execution_state_changes_from_response(response)
+
+        self.assertEqual([item["source_action"] for item in changes["robot_changes"]], ["MoveAhead", "LookDown"])
+        self.assertEqual(changes["robot_changes"][1]["after"]["horizon"], 30.0)
+        self.assertEqual(changes["object_changes"], [])
+        self.assertEqual(changes["inventory_changes"], [])
+
+    def test_failed_action_only_records_trace(self) -> None:
+        response = {"status": "partial", "results": [{"index": 0, "action": "BreakObject", "success": False, "error": "not breakable", "interacted_objects": [{"objectId": "Plate|1", "after": {"objectType": "Plate"}}]}]}
+
+        changes = execution_state_changes_from_response(response)
+
+        self.assertEqual(changes["action_traces"][0]["error"], "not breakable")
+        self.assertEqual(changes["object_changes"], [])
+
+
+class TaskIntentToolTest(unittest.TestCase):
+    def test_parses_qwen_tool_call_block(self) -> None:
+        output = '<tool_call>{"name":"extract_task_intent","arguments":{"task":"Pick up the apple."}}</tool_call>'
+
+        self.assertEqual(
+            parse_qwen_tool_call(output),
+            {"name": "extract_task_intent", "arguments": {"task": "Pick up the apple."}},
+        )
+
+    def test_parses_openai_style_tool_call(self) -> None:
+        output = json.dumps(
+            {
+                "tool_calls": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "extract_task_intent",
+                            "arguments": json.dumps({"task": "Turn right."}),
+                        },
+                    }
+                ]
+            }
+        )
+
+        self.assertEqual(
+            parse_qwen_tool_call(output),
+            {"name": "extract_task_intent", "arguments": {"task": "Turn right."}},
+        )
+
+    def test_rejects_missing_tool_call(self) -> None:
+        with self.assertRaisesRegex(ValueError, "valid tool call"):
+            parse_qwen_tool_call('{"answer":"no tool"}')
+
+    def test_rejects_qwen_xml_placeholder_tool_call(self) -> None:
+        output = (
+            "<tool_call><function=example_function_name>"
+            "<parameter=example_parameter_1>value_1</parameter>"
+            "</function></tool_call>"
+        )
+
+        with self.assertRaisesRegex(ValueError, "valid tool call"):
+            parse_qwen_tool_call(output)
+
+
+    def test_tool_call_validation_warns_when_task_argument_missing(self) -> None:
+        validation = validate_task_intent_tool_call(
+            {"name": "extract_task_intent", "arguments": {}},
+            "Pick up the apple.",
+        )
+
+        self.assertEqual(validation["status"], "warning")
+        self.assertIn("omitted required argument", validation["warnings"][0])
+
+    def test_tool_call_validation_warns_when_task_argument_differs(self) -> None:
+        validation = validate_task_intent_tool_call(
+            {"name": "extract_task_intent", "arguments": {"task": "Pick up the tomato."}},
+            "Pick up the apple.",
+        )
+
+        self.assertEqual(validation["status"], "warning")
+        self.assertIn("differs from original", validation["warnings"][0])
+
+    def test_tool_call_validation_rejects_wrong_tool(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "unexpected tool"):
+            validate_task_intent_tool_call({"name": "other_tool", "arguments": {"task": "x"}}, "x")
+
+    def test_local_tool_uses_original_task_intent(self) -> None:
+        intent = execute_extract_task_intent_tool("Pick up the apple.", ["Tomato"])
+
+        self.assertEqual(intent["requestedAction"], "PickupObject")
+        self.assertEqual(intent["requestedObjectType"], "Apple")
+        self.assertEqual(
+            intent["intentSteps"],
+            [{"order": 1, "action": "PickupObject", "objectType": "Apple", "targetType": None}],
+        )
+
+    def test_local_tool_extracts_multi_step_intent(self) -> None:
+        intent = execute_extract_task_intent_tool("Open the fridge and pick up the apple.", ["Fridge", "Apple"])
+
+        self.assertEqual(
+            intent["intentSteps"],
+            [
+                {"order": 1, "action": "OpenObject", "objectType": "Fridge", "targetType": None},
+                {"order": 2, "action": "PickupObject", "objectType": "Apple", "targetType": None},
+            ],
+        )
+
+    def test_external_task_intent_json_bypasses_legacy_extraction(self) -> None:
+        payload = {
+            "task_intent_source": "qwen_normalizer_tool_call",
+            "task_intent": {
+                "requestedAction": "PickupObject",
+                "requestedObjectType": "Tomato",
+                "requestedTargetType": "CounterTop",
+                "intentSteps": [
+                    {"order": 1, "action": "PickupObject", "objectType": "Tomato", "targetType": None},
+                    {"order": 2, "action": "PutObject", "objectType": "Tomato", "targetType": "CounterTop"},
+                ],
+            },
+            "task_normalization": {"normalized_task": "pick up the Tomato and put it on the CounterTop."},
+        }
+        args = auto_scene_actions_module.parse_args(
+            ["--task", "pick up tomato and put it on counter", "--task-intent-json", json.dumps(payload)]
+        )
+        old_generate = auto_scene_actions_module.generate_task_intent_tool_call
+        auto_scene_actions_module.generate_task_intent_tool_call = lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("external task intent must bypass legacy extraction")
+        )
+        try:
+            tool_call, intent, validation = auto_scene_actions_module.task_intent_from_args(args, ["Tomato", "CounterTop"])
+        finally:
+            auto_scene_actions_module.generate_task_intent_tool_call = old_generate
+
+        self.assertEqual(tool_call["name"], "external_task_intent")
+        self.assertEqual(validation["status"], "ok")
+        self.assertEqual(auto_scene_actions_module.task_intent_source_for_args(args), "qwen_normalizer_tool_call")
+        self.assertEqual(intent["requestedTargetType"], "CounterTop")
+        self.assertEqual(intent["intentSteps"][1]["action"], "PutObject")
+        self.assertEqual(getattr(args, "_task_normalization")["normalized_task"], "pick up the Tomato and put it on the CounterTop.")
+
+    def test_local_tool_resolves_it_for_put_object(self) -> None:
+        intent = execute_extract_task_intent_tool("Pick up the apple and put it on the counter.", ["Apple", "CounterTop"])
+
+        self.assertEqual(
+            intent["intentSteps"],
+            [
+                {"order": 1, "action": "PickupObject", "objectType": "Apple", "targetType": None},
+                {"order": 2, "action": "PutObject", "objectType": "Apple", "targetType": "CounterTop"},
+            ],
+        )
+
+    def test_local_tool_extracts_navigation_sequence(self) -> None:
+        intent = execute_extract_task_intent_tool("Turn right, move ahead, then open the cabinet.", ["Cabinet"])
+
+        self.assertEqual(
+            intent["intentSteps"],
+            [
+                {"order": 1, "action": "RotateRight", "objectType": None, "targetType": None},
+                {"order": 2, "action": "MoveAhead", "objectType": None, "targetType": None},
+                {"order": 3, "action": "OpenObject", "objectType": "Cabinet", "targetType": None},
+            ],
+        )
+
+    def test_rejects_model_target_that_conflicts_with_task_intent(self) -> None:
+        task_intent = {"requestedAction": "PickupObject", "requestedObjectType": "Apple"}
+        semantic_plan = {"targetObjectType": "Tomato", "plan": [{"action": "PickupObject", "objectType": "Tomato"}]}
+
+        with self.assertRaisesRegex(ValueError, "Tomato.*Apple"):
+            validate_task_intent_consistency(task_intent, semantic_plan, check_action=False)
+
+    def test_multi_step_verifier_allows_ordered_steps_with_navigation_between(self) -> None:
+        task_intent = {
+            "intentSteps": [
+                {"order": 1, "action": "OpenObject", "objectType": "Fridge", "targetType": None},
+                {"order": 2, "action": "PickupObject", "objectType": "Apple", "targetType": None},
+            ]
+        }
+        semantic_plan = {
+            "plan": [
+                {"action": "OpenObject", "objectType": "Fridge", "targetType": None},
+                {"action": "LookDown", "objectType": None, "targetType": None},
+                {"action": "PickupObject", "objectType": "Apple", "targetType": None},
+            ]
+        }
+
+        validate_intent_steps_consistency(task_intent, semantic_plan)
+
+    def test_multi_step_verifier_rejects_missing_step(self) -> None:
+        task_intent = {
+            "intentSteps": [
+                {"order": 1, "action": "OpenObject", "objectType": "Fridge", "targetType": None},
+                {"order": 2, "action": "PickupObject", "objectType": "Apple", "targetType": None},
+            ]
+        }
+        semantic_plan = {"plan": [{"action": "OpenObject", "objectType": "Fridge", "targetType": None}]}
+
+        with self.assertRaisesRegex(ValueError, "missing intent step 2"):
+            validate_intent_steps_consistency(task_intent, semantic_plan)
+
+    def test_multi_step_verifier_rejects_wrong_object(self) -> None:
+        task_intent = {"intentSteps": [{"order": 1, "action": "PickupObject", "objectType": "Apple", "targetType": None}]}
+        semantic_plan = {"plan": [{"action": "PickupObject", "objectType": "Tomato", "targetType": None}]}
+
+        with self.assertRaisesRegex(ValueError, "Tomato.*Apple"):
+            validate_intent_steps_consistency(task_intent, semantic_plan)
+
+    def test_multi_step_verifier_rejects_wrong_order(self) -> None:
+        task_intent = {
+            "intentSteps": [
+                {"order": 1, "action": "OpenObject", "objectType": "Fridge", "targetType": None},
+                {"order": 2, "action": "PickupObject", "objectType": "Apple", "targetType": None},
+            ]
+        }
+        semantic_plan = {
+            "plan": [
+                {"action": "PickupObject", "objectType": "Apple", "targetType": None},
+                {"action": "OpenObject", "objectType": "Fridge", "targetType": None},
+            ]
+        }
+
+        with self.assertRaisesRegex(ValueError, "missing intent step 2"):
+            validate_intent_steps_consistency(task_intent, semantic_plan)
+
+    def test_run_outputs_tool_call_validation_warning(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            probe = {
+                "state": {
+                    "sceneName": "FloorPlan1",
+                    "objects": [{"id": "Apple|1", "type": "Apple", "visible": True, "pickupable": True}],
+                },
+                "image_base64": "eA==",
+            }
+            semantic_plan = {
+                "task": "Pick up the apple.",
+                "targetObjectType": "Apple",
+                "needsGrounding": True,
+                "observations": [],
+                "plan": [{"action": "PickupObject", "objectType": "Apple", "targetType": None}],
+            }
+
+            def missing_argument_tool_call(args, available_types):
+                tool_call = {"name": "extract_task_intent", "arguments": {}}
+                return (
+                    tool_call,
+                    execute_extract_task_intent_tool(args.task, available_types),
+                    validate_task_intent_tool_call(tool_call, args.task),
+                )
+
+            old_probe = auto_scene_actions_module.probe_scene
+            old_generate = auto_scene_actions_module.generate_semantic_plan
+            old_send = auto_scene_actions_module.send_actions
+            old_tool_call = auto_scene_actions_module.generate_task_intent_tool_call
+            auto_scene_actions_module.probe_scene = lambda *args, **kwargs: probe
+            auto_scene_actions_module.generate_semantic_plan = lambda *args, **kwargs: ("{}", semantic_plan, None)
+            auto_scene_actions_module.generate_task_intent_tool_call = missing_argument_tool_call
+            auto_scene_actions_module.send_actions = lambda *args, **kwargs: json.dumps({"status": "success"})
+            try:
+                args = auto_scene_actions_module.parse_args(
+                    [
+                        "--execute-actions-url",
+                        "http://127.0.0.1:1/execute_actions",
+                        "--task",
+                        "Pick up the apple.",
+                        "--task-id",
+                        "task-1",
+                        "--output-dir",
+                        temp_dir,
+                        "--dry-run",
+                    ]
+                )
+                stdout = io.StringIO()
+                stderr = io.StringIO()
+                with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                    exit_code = auto_scene_actions_module.run(args)
+            finally:
+                auto_scene_actions_module.probe_scene = old_probe
+                auto_scene_actions_module.generate_semantic_plan = old_generate
+                auto_scene_actions_module.generate_task_intent_tool_call = old_tool_call
+                auto_scene_actions_module.send_actions = old_send
+
+        self.assertEqual(exit_code, 0)
+        output = json.loads(stdout.getvalue())
+        self.assertEqual(output["task_intent_tool_call_validation"]["status"], "warning")
+        self.assertIn("omitted required argument", output["task_intent_tool_call_validation"]["warnings"][0])
+
+
+class ObjectVisibilityMapTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.old_task_intent_tool_call = auto_scene_actions_module.generate_task_intent_tool_call
+        auto_scene_actions_module.generate_task_intent_tool_call = fake_task_intent_tool_call
+
+    def tearDown(self) -> None:
+        auto_scene_actions_module.generate_task_intent_tool_call = self.old_task_intent_tool_call
+
+    def test_peer_visible_message_mentions_executor_in_relay_mode(self) -> None:
+        visibility_map = build_object_visibility_map(
+            [
+                {
+                    "agent_id": "robot_0",
+                    "robot_id": 0,
+                    "is_primary": True,
+                    "objects": [{"id": "Egg|1", "type": "Egg", "visible": True, "pickupable": True}],
+                },
+                {
+                    "agent_id": "robot_1",
+                    "robot_id": 1,
+                    "is_primary": False,
+                    "objects": [{"id": "Apple|1", "type": "Apple", "visible": True, "pickupable": True}],
+                },
+            ]
+        )
+        semantic_plan = {"targetObjectType": "Apple", "plan": [{"action": "PickupObject", "objectType": "Apple"}]}
+
+        local_result = coordination_result_for_plan("Pick up the apple.", semantic_plan, visibility_map)
+        relay_result = coordination_result_for_plan(
+            "Pick up the apple.",
+            semantic_plan,
+            visibility_map,
+            relay_mode=True,
+        )
+
+        self.assertIn("refusing to execute locally", local_result["message"])
+        self.assertIn("selecting peer robot 'robot_1' as executor", relay_result["message"])
+
+    def test_single_agent_probe_becomes_agent_zero(self) -> None:
+        probe = {
+            "state": {
+                "sceneName": "FloorPlan1",
+                "objects": [{"id": "Egg|1", "type": "Egg", "visible": True, "pickupable": True}],
+            },
+            "image_base64": "eA==",
+        }
+
+        observations = extract_agent_observations(probe)
+        visibility_map = build_object_visibility_map(observations)
+
+        self.assertEqual(observations[0]["agent_id"], "robot_0")
+        self.assertTrue(observations[0]["is_primary"])
+        self.assertEqual(visibility_map["primary_agent_id"], "robot_0")
+        self.assertEqual(visibility_map["objects_by_type"]["egg"]["visible_by_agent_ids"], ["robot_0"])
+
+    def test_probe_response_with_state_selected_robot_id_uses_requested_primary_robot_id(self) -> None:
+        probe = {
+            "status": "success",
+            "results": [
+                {
+                    "robot_id": 2,
+                    "robot_name": "Robot2",
+                    "image_base64": "eA==",
+                }
+            ],
+            "state": {
+                "sceneName": "FloorPlan1",
+                "selected_robot_id": 2,
+                "objects": [{"id": "Apple|2", "type": "Apple", "visible": True, "pickupable": True}],
+            },
+        }
+
+        observations = extract_agent_observations(probe, primary_robot_id=2)
+
+        self.assertEqual(observations[0]["robot_id"], 2)
+        self.assertEqual(observations[0]["agent_id"], "robot_2")
+        self.assertTrue(observations[0]["is_primary"])
+
+    def test_peer_visible_target_is_reported(self) -> None:
+        probe = {
+            "events": [
+                {
+                    "agentId": "agent_0",
+                    "metadata": {
+                        "sceneName": "FloorPlan1",
+                        "objects": [{"id": "Egg|1", "type": "Egg", "visible": True, "pickupable": True}],
+                    },
+                },
+                {
+                    "agentId": "agent_1",
+                    "metadata": {
+                        "sceneName": "FloorPlan1",
+                        "objects": [{"id": "Apple|1", "type": "Apple", "visible": True, "pickupable": True}],
+                    },
+                },
+            ]
+        }
+        semantic_plan = {"targetObjectType": "Apple", "plan": [{"action": "PickupObject", "objectType": "Apple"}]}
+
+        observations = extract_agent_observations(probe)
+        visibility_map = build_object_visibility_map(observations)
+        result = coordination_result_for_plan("Pick up the apple.", semantic_plan, visibility_map)
+
+        self.assertEqual(result["status"], "target_visible_by_peer")
+        self.assertEqual(result["visible_peer_agent_ids"], ["robot_1"])
+
+    def test_primary_agent_id_can_be_selected(self) -> None:
+        probe = {
+            "agents": [
+                {"id": "agent_0", "objects": [{"id": "Egg|1", "type": "Egg", "visible": True}]},
+                {"id": "agent_1", "objects": [{"id": "Apple|1", "type": "Apple", "visible": True}]},
+            ]
+        }
+
+        observations = extract_agent_observations(probe, primary_robot_id=1)
+        visibility_map = build_object_visibility_map(observations)
+
+        self.assertEqual(visibility_map["primary_agent_id"], "robot_1")
+        self.assertEqual(visibility_map["objects_by_type"]["apple"]["best_agent_id"], "robot_1")
+
+    def test_visibility_summary_does_not_expand_objects(self) -> None:
+        observations = extract_agent_observations(
+            {
+                "state": {
+                    "objects": [
+                        {"id": "Apple|1", "type": "Apple", "visible": True, "pickupable": True},
+                        {"id": "Fridge|1", "type": "Fridge", "visible": False, "openable": True},
+                    ],
+                },
+                "image_base64": "eA==",
+            }
+        )
+
+        summary = object_visibility_summary(build_object_visibility_map(observations))
+        summary_text = json.dumps(summary)
+
+        self.assertEqual(summary["total_object_type_count"], 2)
+        self.assertEqual(summary["visible_object_type_count"], 1)
+        self.assertEqual(summary["hidden_object_type_count"], 1)
+        self.assertEqual(summary["visible_object_types"][0]["object_type"], "Apple")
+        self.assertNotIn("Apple|1", summary_text)
+        self.assertNotIn("Fridge", summary_text)
+        self.assertNotIn('"objects"', summary_text)
+        self.assertNotIn('"affordances"', summary_text)
+        self.assertNotIn('"object_types"', summary_text)
+
+    def test_run_rejects_model_target_that_conflicts_with_task_intent(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            probe = {
+                "state": {
+                    "sceneName": "FloorPlan1",
+                    "objects": [{"id": "Tomato|1", "type": "Tomato", "visible": True, "pickupable": True}],
+                },
+                "image_base64": "eA==",
+            }
+            semantic_plan = {
+                "task": "Pick up the apple.",
+                "targetObjectType": "Tomato",
+                "needsGrounding": True,
+                "observations": [],
+                "plan": [{"action": "PickupObject", "objectType": "Tomato", "targetType": None}],
+            }
+            old_probe = auto_scene_actions_module.probe_scene
+            old_generate = auto_scene_actions_module.generate_semantic_plan
+            old_send = auto_scene_actions_module.send_actions
+            auto_scene_actions_module.probe_scene = lambda *args, **kwargs: probe
+            auto_scene_actions_module.generate_semantic_plan = lambda *args, **kwargs: ("{}", semantic_plan, None)
+            auto_scene_actions_module.send_actions = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("should not send"))
+            try:
+                args = auto_scene_actions_module.parse_args(
+                    [
+                        "--execute-actions-url",
+                        "http://127.0.0.1:1/execute_actions",
+                        "--task",
+                        "Pick up the apple.",
+                        "--task-id",
+                        "task-1",
+                        "--output-dir",
+                        temp_dir,
+                    ]
+                )
+                stdout = io.StringIO()
+                stderr = io.StringIO()
+                with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                    exit_code = auto_scene_actions_module.run(args)
+            finally:
+                auto_scene_actions_module.probe_scene = old_probe
+                auto_scene_actions_module.generate_semantic_plan = old_generate
+                auto_scene_actions_module.send_actions = old_send
+
+        self.assertEqual(exit_code, 0)
+        self.assertIn("Tomato", stderr.getvalue())
+        output = json.loads(stdout.getvalue())
+        self.assertEqual(output["coordination_result"]["status"], "task_intent_mismatch")
+        self.assertEqual(output["task_intent"]["requestedAction"], "PickupObject")
+        self.assertEqual(output["task_intent"]["requestedObjectType"], "Apple")
+        self.assertEqual(output["task_intent_source"], "qwen_native_tool_call")
+        self.assertNotIn("payload", output)
+
+    def test_run_reports_peer_visible_target_without_payload_or_send(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            probe = {
+                "events": [
+                    {
+                        "agentId": "agent_0",
+                        "image_base64": "eA==",
+                        "metadata": {"objects": [{"id": "Egg|1", "type": "Egg", "visible": True, "pickupable": True}]},
+                    },
+                    {
+                        "agentId": "agent_1",
+                        "image_base64": "eA==",
+                        "metadata": {"objects": [{"id": "Apple|1", "type": "Apple", "visible": True, "pickupable": True}]},
+                    },
+                ]
+            }
+            semantic_plan = {
+                "task": "Pick up the apple.",
+                "targetObjectType": "Apple",
+                "needsGrounding": True,
+                "observations": [],
+                "plan": [{"action": "PickupObject", "objectType": "Apple", "targetType": None}],
+            }
+            old_probe = auto_scene_actions_module.probe_scene
+            old_generate = auto_scene_actions_module.generate_semantic_plan
+            old_send = auto_scene_actions_module.send_actions
+            auto_scene_actions_module.probe_scene = lambda *args, **kwargs: probe
+            auto_scene_actions_module.generate_semantic_plan = lambda *args, **kwargs: ("{}", semantic_plan, None)
+            auto_scene_actions_module.send_actions = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("should not send"))
+            try:
+                args = auto_scene_actions_module.parse_args(
+                    [
+                        "--execute-actions-url",
+                        "http://127.0.0.1:1/execute_actions",
+                        "--task",
+                        "Pick up the apple.",
+                        "--task-id",
+                        "task-1",
+                        "--output-dir",
+                        temp_dir,
+                    ]
+                )
+                stdout = io.StringIO()
+                stderr = io.StringIO()
+                with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                    exit_code = auto_scene_actions_module.run(args)
+            finally:
+                auto_scene_actions_module.probe_scene = old_probe
+                auto_scene_actions_module.generate_semantic_plan = old_generate
+                auto_scene_actions_module.send_actions = old_send
+
+        self.assertEqual(exit_code, 0)
+        self.assertNotIn("Sending", stderr.getvalue())
+        output = json.loads(stdout.getvalue())
+        self.assertEqual(output["coordination_result"]["status"], "target_visible_by_peer")
+        self.assertNotIn("payload", output)
+
+    def test_closed_loop_dry_run_builds_step_payloads_without_done_until_final(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            probe = {
+                "sceneName": "FloorPlan1",
+                "selected_robot_id": 0,
+                "robots": [{"robot_id": 0}],
+                "objects": [
+                    {"id": "Fridge|1", "type": "Fridge", "visible": True, "openable": True, "receptacle": True},
+                    {"id": "Apple|1", "type": "Apple", "visible": True, "pickupable": True},
+                ],
+                "image_base64": "eA==",
+            }
+
+            def generate(args, image_path, objects, task_id):
+                if "open" in args.task.lower():
+                    plan = {
+                        "task": args.task,
+                        "targetObjectType": "Fridge",
+                        "needsGrounding": True,
+                        "observations": [],
+                        "plan": [{"action": "OpenObject", "objectType": "Fridge", "targetType": None}],
+                    }
+                else:
+                    plan = {
+                        "task": args.task,
+                        "targetObjectType": "Apple",
+                        "needsGrounding": True,
+                        "observations": [],
+                        "plan": [{"action": "PickupObject", "objectType": "Apple", "targetType": None}],
+                    }
+                return "{}", plan, None
+
+            old_probe = auto_scene_actions_module.probe_scene
+            old_generate = auto_scene_actions_module.generate_semantic_plan
+            old_send = auto_scene_actions_module.send_actions
+            old_observe = auto_scene_actions_module.observe_robot
+            auto_scene_actions_module.probe_scene = lambda *args, **kwargs: probe
+            auto_scene_actions_module.generate_semantic_plan = generate
+            auto_scene_actions_module.send_actions = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("dry-run should not send"))
+            auto_scene_actions_module.observe_robot = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("dry-run should not observe"))
+            try:
+                args = auto_scene_actions_module.parse_args(
+                    [
+                        "--execute-actions-url",
+                        "http://127.0.0.1:1/execute_actions",
+                        "--task",
+                        "Open the fridge and pick up the apple.",
+                        "--task-id",
+                        "task-1",
+                        "--output-dir",
+                        temp_dir,
+                        "--relay-mode",
+                        "--relay-strategy",
+                        "rules",
+                        "--closed-loop-replan",
+                        "--dry-run",
+                    ]
+                )
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(io.StringIO()):
+                    exit_code = auto_scene_actions_module.run(args)
+            finally:
+                auto_scene_actions_module.probe_scene = old_probe
+                auto_scene_actions_module.generate_semantic_plan = old_generate
+                auto_scene_actions_module.send_actions = old_send
+                auto_scene_actions_module.observe_robot = old_observe
+
+        self.assertEqual(exit_code, 0)
+        output = json.loads(stdout.getvalue())
+        self.assertEqual(output["closed_loop_result"]["status"], "success")
+        self.assertEqual(len(output["intent_steps"]), 2)
+        self.assertEqual(output["step_payloads"][0]["actions"], [{"action": "OpenObject", "objectId": "Fridge|1", "forceAction": True}])
+        self.assertEqual(output["step_payloads"][1]["actions"], [{"action": "PickupObject", "objectId": "Apple|1", "forceAction": True}])
+        self.assertEqual(output["step_payloads"][2]["actions"], [{"action": "Done"}])
+        self.assertEqual([payload["stop_on_failure"] for payload in output["step_payloads"]], [False, False, False])
+
+    def test_closed_loop_relay_dry_run_selects_peer_executor(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            probe = {
+                "sceneName": "FloorPlan1",
+                "selected_robot_id": 1,
+                "robots": [{"robot_id": 0}, {"robot_id": 1}],
+                "objects": [{"id": "Fridge|1", "type": "Fridge", "visible": True, "openable": True}],
+                "image_base64": "eA==",
+            }
+            peer_observe = {
+                "status": "success",
+                "robot_id": 0,
+                "robot": {"name": "Robot0"},
+                "objects": [{"id": "Apple|1", "type": "Apple", "visible": True, "pickupable": True}],
+                "image_base64": "eA==",
+            }
+            semantic_plan = {
+                "task": "pick up the apple.",
+                "targetObjectType": "Apple",
+                "needsGrounding": True,
+                "observations": [],
+                "plan": [{"action": "PickupObject", "objectType": "Apple", "targetType": None}],
+            }
+            old_probe = auto_scene_actions_module.probe_scene
+            old_generate = auto_scene_actions_module.generate_semantic_plan
+            old_execute_probe = auto_scene_actions_module.execute_actions_probe_scene
+            old_send = auto_scene_actions_module.send_actions
+            auto_scene_actions_module.probe_scene = lambda *args, **kwargs: probe
+            auto_scene_actions_module.generate_semantic_plan = lambda *args, **kwargs: ("{}", semantic_plan, None)
+            auto_scene_actions_module.execute_actions_probe_scene = lambda *args, **kwargs: peer_observe
+            auto_scene_actions_module.send_actions = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("dry-run should not send"))
+            try:
+                args = auto_scene_actions_module.parse_args(
+                    [
+                        "--execute-actions-url",
+                        "http://127.0.0.1:1/execute_actions",
+                        "--task",
+                        "Pick up the apple.",
+                        "--task-id",
+                        "task-1",
+                        "--output-dir",
+                        temp_dir,
+                        "--relay-mode",
+                        "--relay-strategy",
+                        "rules",
+                        "--primary-robot-id",
+                        "1",
+                        "--closed-loop-replan",
+                        "--dry-run",
+                    ]
+                )
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(io.StringIO()):
+                    exit_code = auto_scene_actions_module.run(args)
+            finally:
+                auto_scene_actions_module.probe_scene = old_probe
+                auto_scene_actions_module.generate_semantic_plan = old_generate
+                auto_scene_actions_module.execute_actions_probe_scene = old_execute_probe
+                auto_scene_actions_module.send_actions = old_send
+
+        self.assertEqual(exit_code, 0)
+        output = json.loads(stdout.getvalue())
+        self.assertEqual(output["closed_loop_result"]["status"], "success")
+        self.assertEqual(output["closed_loop_trace"][0]["executor_robot_id"], 0)
+        self.assertEqual(output["step_payloads"][0]["robot_id"], 0)
+        self.assertEqual(output["step_payloads"][0]["actions"][0]["objectId"], "Apple|1")
+
+    def test_closed_loop_pickup_step_skips_when_peer_already_holds_object(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            probe = {
+                "sceneName": "FloorPlan1",
+                "selected_robot_id": 0,
+                "state": {"robots": [{"robot_id": 0}, {"robot_id": 1}]},
+                "objects": [
+                    {"id": "CounterTop|0", "type": "CounterTop", "visible": True, "receptacle": True},
+                    {"id": "Pan|1", "type": "Pan", "visible": False, "pickupable": True},
+                ],
+                "image_base64": "eA==",
+            }
+            peer_observe = {
+                "status": "success",
+                "robot_id": 1,
+                "robot": {
+                    "robot_id": 1,
+                    "name": "Robot1",
+                    "held_object": {"objectId": "Pan|1", "objectType": "Pan"},
+                    "inventory": [{"objectId": "Pan|1", "objectType": "Pan"}],
+                },
+                "objects": [
+                    {"id": "CounterTop|1", "type": "CounterTop", "visible": True, "receptacle": True},
+                    {"id": "Pan|1", "type": "Pan", "visible": False, "pickupable": True},
+                ],
+                "image_base64": "eA==",
+            }
+            put_plan = {
+                "task": "put the pan on the countertop.",
+                "targetObjectType": "Pan",
+                "needsGrounding": True,
+                "observations": [],
+                "plan": [{"action": "PutObject", "objectType": "Pan", "targetType": "CounterTop"}],
+            }
+            generated = [put_plan]
+            observed_robot_ids = []
+            sent_payloads = []
+            old_probe = auto_scene_actions_module.probe_scene
+            old_generate = auto_scene_actions_module.generate_semantic_plan
+            old_execute_probe = auto_scene_actions_module.execute_actions_probe_scene
+            old_send = auto_scene_actions_module.send_actions
+            auto_scene_actions_module.probe_scene = lambda *args, **kwargs: probe
+            auto_scene_actions_module.generate_semantic_plan = lambda *args, **kwargs: ("{}", generated.pop(0), None)
+            auto_scene_actions_module.execute_actions_probe_scene = lambda url, task_id, timeout, robot_id=0: observed_robot_ids.append(robot_id) or peer_observe
+
+            def fake_send(url, payload, timeout):
+                sent_payloads.append(payload)
+                return json.dumps({"status": "success", "results": [{"robot_id": payload.get("robot_id"), "action": payload["actions"][0]["action"], "success": True}], "state": {"objects": []}})
+
+            auto_scene_actions_module.send_actions = fake_send
+            try:
+                args = auto_scene_actions_module.parse_args(
+                    [
+                        "--execute-actions-url",
+                        "http://127.0.0.1:1/execute_actions",
+                        "--task",
+                        "put the pan on the counter",
+                        "--task-id",
+                        "task-1",
+                        "--output-dir",
+                        temp_dir,
+                        "--relay-mode",
+                        "--relay-strategy",
+                        "rules",
+                        "--primary-robot-id",
+                        "0",
+                        "--closed-loop-replan",
+                    ]
+                )
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(io.StringIO()):
+                    exit_code = auto_scene_actions_module.run(args)
+            finally:
+                auto_scene_actions_module.probe_scene = old_probe
+                auto_scene_actions_module.generate_semantic_plan = old_generate
+                auto_scene_actions_module.execute_actions_probe_scene = old_execute_probe
+                auto_scene_actions_module.send_actions = old_send
+
+        self.assertEqual(exit_code, 0)
+        output = json.loads(stdout.getvalue())
+        self.assertEqual(observed_robot_ids, [1])
+        self.assertEqual(
+            output["intent_steps"],
+            [{"order": 1, "action": "PutObject", "objectType": "Pan", "targetType": "CounterTop"}],
+        )
+        self.assertNotIn("intentExpansionWarnings", output["task_intent"])
+        self.assertEqual(output["closed_loop_trace"][0]["executor_robot_id"], 1)
+        self.assertEqual(output["closed_loop_trace"][0]["actions"], [{"action": "PutObject", "objectId": "CounterTop|1", "forceAction": True}])
+        self.assertEqual(sent_payloads[0]["robot_id"], 1)
+        self.assertIs(sent_payloads[0]["stop_on_failure"], False)
+        self.assertEqual(sent_payloads[0]["actions"], [{"action": "PutObject", "objectId": "CounterTop|1", "forceAction": True}])
+
+    def test_closed_loop_put_inserts_pickup_when_no_robot_holds_object_but_peer_sees_it(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            probe = {
+                "sceneName": "FloorPlan1",
+                "selected_robot_id": 0,
+                "state": {"robots": [{"robot_id": 0}, {"robot_id": 1}]},
+                "objects": [
+                    {"id": "CounterTop|0", "type": "CounterTop", "visible": True, "receptacle": True},
+                    {"id": "Pan|1", "type": "Pan", "visible": False, "pickupable": True},
+                ],
+                "image_base64": "eA==",
+            }
+            peer_observe = {
+                "status": "success",
+                "robot_id": 1,
+                "robot": {"robot_id": 1, "name": "Robot1", "inventory": []},
+                "objects": [
+                    {"id": "CounterTop|1", "type": "CounterTop", "visible": True, "receptacle": True},
+                    {"id": "Pan|1", "type": "Pan", "visible": True, "pickupable": True},
+                ],
+                "image_base64": "eA==",
+            }
+            pickup_plan = {
+                "task": "pick up the pan",
+                "targetObjectType": "Pan",
+                "needsGrounding": True,
+                "observations": [],
+                "plan": [{"action": "PickupObject", "objectType": "Pan", "targetType": None}],
+            }
+            put_plan = {
+                "task": "put the pan on the countertop.",
+                "targetObjectType": "Pan",
+                "needsGrounding": True,
+                "observations": [],
+                "plan": [{"action": "PutObject", "objectType": "Pan", "targetType": "CounterTop"}],
+            }
+            generated = [pickup_plan, put_plan]
+            observed_robot_ids = []
+            sent_payloads = []
+            old_probe = auto_scene_actions_module.probe_scene
+            old_generate = auto_scene_actions_module.generate_semantic_plan
+            old_execute_probe = auto_scene_actions_module.execute_actions_probe_scene
+            old_send = auto_scene_actions_module.send_actions
+            auto_scene_actions_module.probe_scene = lambda *args, **kwargs: probe
+            auto_scene_actions_module.generate_semantic_plan = lambda *args, **kwargs: ("{}", generated.pop(0), None)
+            auto_scene_actions_module.execute_actions_probe_scene = lambda url, task_id, timeout, robot_id=0: observed_robot_ids.append(robot_id) or peer_observe
+
+            def fake_send(url, payload, timeout):
+                sent_payloads.append(payload)
+                held = [{"objectId": "Pan|1", "objectType": "Pan"}] if payload["actions"][0]["action"] == "PickupObject" else []
+                return json.dumps({
+                    "status": "success",
+                    "results": [
+                        {
+                            "robot_id": payload.get("robot_id"),
+                            "action": payload["actions"][0]["action"],
+                            "success": True,
+                            "inventory": held,
+                            "held_object": held[0] if held else None,
+                        }
+                    ],
+                    "state": {"objects": []},
+                })
+
+            auto_scene_actions_module.send_actions = fake_send
+            try:
+                args = auto_scene_actions_module.parse_args(
+                    [
+                        "--execute-actions-url",
+                        "http://127.0.0.1:1/execute_actions",
+                        "--task",
+                        "put the pan on the counter",
+                        "--task-id",
+                        "task-1",
+                        "--output-dir",
+                        temp_dir,
+                        "--relay-mode",
+                        "--relay-strategy",
+                        "rules",
+                        "--primary-robot-id",
+                        "0",
+                        "--closed-loop-replan",
+                    ]
+                )
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(io.StringIO()):
+                    exit_code = auto_scene_actions_module.run(args)
+            finally:
+                auto_scene_actions_module.probe_scene = old_probe
+                auto_scene_actions_module.generate_semantic_plan = old_generate
+                auto_scene_actions_module.execute_actions_probe_scene = old_execute_probe
+                auto_scene_actions_module.send_actions = old_send
+
+        self.assertEqual(exit_code, 0)
+        output = json.loads(stdout.getvalue())
+        self.assertEqual(observed_robot_ids, [1])
+        self.assertEqual(output["intent_steps"][0]["action"], "PickupObject")
+        self.assertEqual(output["intent_steps"][1]["action"], "PutObject")
+        self.assertIn("canonicalized PutObject", output["task_intent"]["intentExpansionWarnings"][0])
+        self.assertEqual(sent_payloads[0]["robot_id"], 1)
+        self.assertEqual(sent_payloads[0]["actions"], [{"action": "PickupObject", "objectId": "Pan|1", "forceAction": True}])
+        self.assertEqual(sent_payloads[1]["robot_id"], 1)
+        self.assertEqual(sent_payloads[1]["actions"], [{"action": "PutObject", "objectId": "CounterTop|1", "forceAction": True}])
+
+    def test_closed_loop_put_holder_goto_receptacle_before_put(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            initial_probe = {
+                "sceneName": "FloorPlan1",
+                "selected_robot_id": 0,
+                "state": {"robots": [{"robot_id": 0}, {"robot_id": 1}]},
+                "objects": [
+                    {"id": "CounterTop|0", "type": "CounterTop", "visible": False, "receptacle": True},
+                    {"id": "Pan|1", "type": "Pan", "visible": False, "pickupable": True},
+                ],
+                "image_base64": "eA==",
+            }
+            peer_holder_without_target = {
+                "status": "success",
+                "robot_id": 1,
+                "robot": {
+                    "robot_id": 1,
+                    "name": "Robot1",
+                    "held_object": {"objectId": "Pan|1", "objectType": "Pan"},
+                    "inventory": [{"objectId": "Pan|1", "objectType": "Pan"}],
+                },
+                "objects": [
+                    {"id": "CounterTop|1", "type": "CounterTop", "visible": False, "receptacle": True},
+                    {"id": "Pan|1", "type": "Pan", "visible": False, "pickupable": True},
+                ],
+                "image_base64": "eA==",
+            }
+            refreshed_holder_with_target = {
+                "sceneName": "FloorPlan1",
+                "selected_robot_id": 1,
+                "state": {"robots": [{"robot_id": 0}, {"robot_id": 1}]},
+                "robot": {
+                    "robot_id": 1,
+                    "name": "Robot1",
+                    "held_object": {"objectId": "Pan|1", "objectType": "Pan"},
+                    "inventory": [{"objectId": "Pan|1", "objectType": "Pan"}],
+                },
+                "objects": [
+                    {"id": "CounterTop|1", "type": "CounterTop", "visible": True, "receptacle": True},
+                    {"id": "Pan|1", "type": "Pan", "visible": False, "pickupable": True},
+                ],
+                "image_base64": "eA==",
+            }
+            put_plan = {
+                "task": "put the pan on the countertop.",
+                "targetObjectType": "Pan",
+                "needsGrounding": True,
+                "observations": [],
+                "plan": [{"action": "PutObject", "objectType": "Pan", "targetType": "CounterTop"}],
+            }
+            sent_payloads = []
+            goto_payloads = []
+            old_probe = auto_scene_actions_module.probe_scene
+            old_generate = auto_scene_actions_module.generate_semantic_plan
+            old_execute_probe = auto_scene_actions_module.execute_actions_probe_scene
+            old_send = auto_scene_actions_module.send_actions
+            old_post_json = auto_scene_actions_module.post_json
+
+            def fake_probe(url, task_id, timeout, **kwargs):
+                if "put_holder_goto" in task_id:
+                    return refreshed_holder_with_target
+                return initial_probe
+
+            def fake_post_json(url, payload, timeout):
+                goto_payloads.append(payload)
+                return {
+                    "status": "success",
+                    "execute_result": {
+                        "status": "success",
+                        "results": [
+                            {
+                                "robot_id": payload.get("robot_id"),
+                                "action": "MoveAhead",
+                                "success": True,
+                                "inventory": [{"objectId": "Pan|1", "objectType": "Pan"}],
+                                "held_object": {"objectId": "Pan|1", "objectType": "Pan"},
+                            }
+                        ],
+                    },
+                    "actions": [{"action": "MoveAhead"}],
+                    "path": [],
+                    "estimated_distance": 0.25,
+                    "post_target_visible": True,
+                    "post_target_object_id": "CounterTop|1",
+                }
+
+            def fake_send(url, payload, timeout):
+                sent_payloads.append(payload)
+                return json.dumps({
+                    "status": "success",
+                    "results": [
+                        {
+                            "robot_id": payload.get("robot_id"),
+                            "action": payload["actions"][0]["action"],
+                            "success": True,
+                            "inventory": [],
+                            "held_object": None,
+                        }
+                    ],
+                    "state": {"objects": []},
+                })
+
+            auto_scene_actions_module.probe_scene = fake_probe
+            auto_scene_actions_module.generate_semantic_plan = lambda *args, **kwargs: ("{}", put_plan, None)
+            auto_scene_actions_module.execute_actions_probe_scene = lambda url, task_id, timeout, robot_id=0: peer_holder_without_target
+            auto_scene_actions_module.post_json = fake_post_json
+            auto_scene_actions_module.send_actions = fake_send
+            try:
+                args = auto_scene_actions_module.parse_args(
+                    [
+                        "--execute-actions-url",
+                        "http://127.0.0.1:1/execute_actions",
+                        "--task",
+                        "put the pan on the counter",
+                        "--task-id",
+                        "task-1",
+                        "--output-dir",
+                        temp_dir,
+                        "--relay-mode",
+                        "--relay-strategy",
+                        "rules",
+                        "--primary-robot-id",
+                        "0",
+                        "--closed-loop-replan",
+                    ]
+                )
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(io.StringIO()):
+                    exit_code = auto_scene_actions_module.run(args)
+            finally:
+                auto_scene_actions_module.probe_scene = old_probe
+                auto_scene_actions_module.generate_semantic_plan = old_generate
+                auto_scene_actions_module.execute_actions_probe_scene = old_execute_probe
+                auto_scene_actions_module.post_json = old_post_json
+                auto_scene_actions_module.send_actions = old_send
+
+        self.assertEqual(exit_code, 0)
+        output = json.loads(stdout.getvalue())
+        self.assertEqual(output["closed_loop_result"]["status"], "success")
+        self.assertEqual(goto_payloads[0]["robot_id"], 1)
+        self.assertEqual(goto_payloads[0]["object_type"], "CounterTop")
+        self.assertEqual(output["closed_loop_trace"][0]["relay_result"]["strategy"], "put_holder_goto_receptacle")
+        self.assertEqual(sent_payloads[0]["robot_id"], 1)
+        self.assertEqual(sent_payloads[0]["actions"], [{"action": "PutObject", "objectId": "CounterTop|1", "forceAction": True}])
+
+    def test_closed_loop_real_step_failure_reports_upstream(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            probe = {
+                "sceneName": "FloorPlan1",
+                "selected_robot_id": 0,
+                "robots": [{"robot_id": 0}],
+                "objects": [{"id": "Tomato|1", "type": "Tomato", "visible": True, "pickupable": True}],
+                "image_base64": "eA==",
+            }
+            semantic_plan = {
+                "task": "pick up the tomato.",
+                "targetObjectType": "Tomato",
+                "needsGrounding": True,
+                "observations": [],
+                "plan": [{"action": "PickupObject", "objectType": "Tomato", "targetType": None}],
+            }
+            old_probe = auto_scene_actions_module.probe_scene
+            old_generate = auto_scene_actions_module.generate_semantic_plan
+            old_send = auto_scene_actions_module.send_actions
+            old_observe = auto_scene_actions_module.observe_robot
+            auto_scene_actions_module.probe_scene = lambda *args, **kwargs: probe
+            auto_scene_actions_module.generate_semantic_plan = lambda *args, **kwargs: ("{}", semantic_plan, None)
+            auto_scene_actions_module.send_actions = lambda *args, **kwargs: json.dumps(
+                {"status": "failed", "results": [{"action": "PickupObject", "success": False, "error": "not reachable"}]}
+            )
+            auto_scene_actions_module.observe_robot = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("should not observe after failed execute"))
+            try:
+                args = auto_scene_actions_module.parse_args(
+                    [
+                        "--execute-actions-url",
+                        "http://127.0.0.1:1/execute_actions",
+                        "--task",
+                        "Pick up the tomato.",
+                        "--task-id",
+                        "task-1",
+                        "--output-dir",
+                        temp_dir,
+                        "--relay-mode",
+                        "--relay-strategy",
+                        "rules",
+                        "--closed-loop-replan",
+                    ]
+                )
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(io.StringIO()):
+                    exit_code = auto_scene_actions_module.run(args)
+            finally:
+                auto_scene_actions_module.probe_scene = old_probe
+                auto_scene_actions_module.generate_semantic_plan = old_generate
+                auto_scene_actions_module.send_actions = old_send
+                auto_scene_actions_module.observe_robot = old_observe
+
+        self.assertEqual(exit_code, 0)
+        output = json.loads(stdout.getvalue())
+        self.assertEqual(output["closed_loop_result"]["status"], "needs_upstream_planning")
+        self.assertEqual(output["closed_loop_result"]["failed_step_index"], 1)
+        self.assertIn("failed", output["closed_loop_result"]["reason"])
+
+    def test_run_saves_object_visibility_map(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            probe = {
+                "state": {
+                    "sceneName": "FloorPlan1",
+                    "objects": [{"id": "Apple|1", "type": "Apple", "visible": True, "pickupable": True}],
+                },
+                "image_base64": "eA==",
+            }
+            semantic_plan = {
+                "task": "Pick up the apple.",
+                "targetObjectType": "Apple",
+                "needsGrounding": True,
+                "observations": [],
+                "plan": [{"action": "PickupObject", "objectType": "Apple", "targetType": None}],
+            }
+            old_probe = auto_scene_actions_module.probe_scene
+            old_generate = auto_scene_actions_module.generate_semantic_plan
+            auto_scene_actions_module.probe_scene = lambda *args, **kwargs: probe
+            auto_scene_actions_module.generate_semantic_plan = lambda *args, **kwargs: ("{}", semantic_plan, None)
+            try:
+                args = auto_scene_actions_module.parse_args(
+                    [
+                        "--execute-actions-url",
+                        "http://127.0.0.1:1/execute_actions",
+                        "--task",
+                        "Pick up the apple.",
+                        "--task-id",
+                        "task-1",
+                        "--output-dir",
+                        temp_dir,
+                        "--dry-run",
+                        "--save-object-visibility-map",
+                    ]
+                )
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(io.StringIO()):
+                    exit_code = auto_scene_actions_module.run(args)
+            finally:
+                auto_scene_actions_module.probe_scene = old_probe
+                auto_scene_actions_module.generate_semantic_plan = old_generate
+
+            self.assertEqual(exit_code, 0)
+            output = json.loads(stdout.getvalue())
+            visibility_path = Path(output["object_visibility_map_path"])
+            self.assertTrue(visibility_path.exists())
+            self.assertEqual(json.loads(visibility_path.read_text(encoding="utf-8"))["primary_agent_id"], "robot_0")
+
+
+    def test_relay_mode_primary_visible_adds_executor_agent_id(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            probe = {
+                "state": {
+                    "sceneName": "FloorPlan1",
+                    "objects": [{"id": "Apple|1", "type": "Apple", "visible": True, "pickupable": True}],
+                },
+                "image_base64": "eA==",
+            }
+            semantic_plan = {
+                "task": "Pick up the apple.",
+                "targetObjectType": "Apple",
+                "needsGrounding": True,
+                "observations": [],
+                "plan": [{"action": "PickupObject", "objectType": "Apple", "targetType": None}],
+            }
+            old_probe = auto_scene_actions_module.probe_scene
+            old_generate = auto_scene_actions_module.generate_semantic_plan
+            auto_scene_actions_module.probe_scene = lambda *args, **kwargs: probe
+            auto_scene_actions_module.generate_semantic_plan = lambda *args, **kwargs: ("{}", semantic_plan, None)
+            try:
+                args = auto_scene_actions_module.parse_args(
+                    [
+                        "--execute-actions-url",
+                        "http://127.0.0.1:1/execute_actions",
+                        "--task",
+                        "Pick up the apple.",
+                        "--task-id",
+                        "task-1",
+                        "--output-dir",
+                        temp_dir,
+                        "--dry-run",
+                        "--relay-mode",
+                        "--relay-strategy",
+                        "rules",
+                    ]
+                )
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(io.StringIO()):
+                    exit_code = auto_scene_actions_module.run(args)
+            finally:
+                auto_scene_actions_module.probe_scene = old_probe
+                auto_scene_actions_module.generate_semantic_plan = old_generate
+
+        self.assertEqual(exit_code, 0)
+        output = json.loads(stdout.getvalue())
+        self.assertEqual(output["relay_result"]["status"], "executor_ready")
+        self.assertEqual(output["executor_agent_id"], "robot_0")
+        self.assertEqual(output["payload"]["robot_id"], 0)
+
+    def test_relay_mode_peer_visible_replans_and_sends_to_peer(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            probe = {
+                "events": [
+                    {
+                        "agentId": "agent_0",
+                        "image_base64": "eA==",
+                        "metadata": {"objects": [{"id": "Egg|1", "type": "Egg", "visible": True, "pickupable": True}]},
+                    },
+                    {
+                        "agentId": "agent_1",
+                        "image_base64": "eA==",
+                        "metadata": {"objects": [{"id": "Apple|1", "type": "Apple", "visible": True, "pickupable": True}]},
+                    },
+                ]
+            }
+            semantic_plan = {
+                "task": "Pick up the apple.",
+                "targetObjectType": "Apple",
+                "needsGrounding": True,
+                "observations": [],
+                "plan": [{"action": "PickupObject", "objectType": "Apple", "targetType": None}],
+            }
+            calls = []
+            captured = {}
+            old_probe = auto_scene_actions_module.probe_scene
+            old_generate = auto_scene_actions_module.generate_semantic_plan
+            old_send = auto_scene_actions_module.send_actions
+            auto_scene_actions_module.probe_scene = lambda *args, **kwargs: probe
+            auto_scene_actions_module.generate_semantic_plan = lambda args, image_path, objects, task_id: calls.append(str(image_path)) or ("{}", semantic_plan, None)
+            def fake_send(url, payload, timeout):
+                captured["payload"] = payload
+                return json.dumps({"status": "success", "state": {"objects": []}})
+
+            auto_scene_actions_module.send_actions = fake_send
+            try:
+                args = auto_scene_actions_module.parse_args(
+                    [
+                        "--execute-actions-url",
+                        "http://127.0.0.1:1/execute_actions",
+                        "--task",
+                        "Pick up the apple.",
+                        "--task-id",
+                        "task-1",
+                        "--output-dir",
+                        temp_dir,
+                        "--relay-mode",
+                        "--relay-strategy",
+                        "rules",
+                    ]
+                )
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(io.StringIO()):
+                    exit_code = auto_scene_actions_module.run(args)
+            finally:
+                auto_scene_actions_module.probe_scene = old_probe
+                auto_scene_actions_module.generate_semantic_plan = old_generate
+                auto_scene_actions_module.send_actions = old_send
+
+        self.assertEqual(exit_code, 0)
+        output = json.loads(stdout.getvalue())
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(output["relay_result"]["status"], "executor_ready")
+        self.assertEqual(output["executor_agent_id"], "robot_1")
+        self.assertEqual(captured["payload"]["robot_id"], 1)
+        self.assertEqual(captured["payload"]["actions"][0]["objectId"], "Apple|1")
+        self.assertIn("executor_semantic_plan", output)
+
+    def test_relay_mode_peer_visible_but_action_not_affordable_reports_upstream(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            probe = {
+                "events": [
+                    {
+                        "agentId": "agent_0",
+                        "image_base64": "eA==",
+                        "metadata": {"objects": [{"id": "Egg|1", "type": "Egg", "visible": True, "pickupable": True}]},
+                    },
+                    {
+                        "agentId": "agent_1",
+                        "image_base64": "eA==",
+                        "metadata": {"objects": [{"id": "Fridge|1", "type": "Fridge", "visible": True, "openable": True, "pickupable": False}]},
+                    },
+                ]
+            }
+            semantic_plan = {
+                "task": "Pick up the fridge.",
+                "targetObjectType": "Fridge",
+                "needsGrounding": True,
+                "observations": [],
+                "plan": [{"action": "PickupObject", "objectType": "Fridge", "targetType": None}],
+            }
+            old_probe = auto_scene_actions_module.probe_scene
+            old_generate = auto_scene_actions_module.generate_semantic_plan
+            old_send = auto_scene_actions_module.send_actions
+            auto_scene_actions_module.probe_scene = lambda *args, **kwargs: probe
+            auto_scene_actions_module.generate_semantic_plan = lambda *args, **kwargs: ("{}", semantic_plan, None)
+            auto_scene_actions_module.send_actions = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("should not send"))
+            try:
+                args = auto_scene_actions_module.parse_args(
+                    [
+                        "--execute-actions-url",
+                        "http://127.0.0.1:1/execute_actions",
+                        "--task",
+                        "Pick up the fridge.",
+                        "--task-id",
+                        "task-1",
+                        "--output-dir",
+                        temp_dir,
+                        "--relay-mode",
+                        "--relay-strategy",
+                        "rules",
+                    ]
+                )
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(io.StringIO()):
+                    exit_code = auto_scene_actions_module.run(args)
+            finally:
+                auto_scene_actions_module.probe_scene = old_probe
+                auto_scene_actions_module.generate_semantic_plan = old_generate
+                auto_scene_actions_module.send_actions = old_send
+
+        self.assertEqual(exit_code, 0)
+        output = json.loads(stdout.getvalue())
+        self.assertEqual(output["relay_result"]["status"], "needs_upstream_planning")
+        self.assertIn("not pickupable", output["relay_result"]["reason"])
+        self.assertNotIn("payload", output)
+
+    def test_relay_mode_target_not_visible_reports_upstream(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            probe = {
+                "events": [
+                    {"agentId": "agent_0", "image_base64": "eA==", "metadata": {"objects": [{"id": "Egg|1", "type": "Egg", "visible": True, "pickupable": True}]}},
+                    {"agentId": "agent_1", "image_base64": "eA==", "metadata": {"objects": [{"id": "Mug|1", "type": "Mug", "visible": True, "pickupable": True}]}},
+                ]
+            }
+            semantic_plan = {
+                "task": "Pick up the banana.",
+                "targetObjectType": "Banana",
+                "needsGrounding": True,
+                "observations": [],
+                "plan": [{"action": "PickupObject", "objectType": "Banana", "targetType": None}],
+            }
+            old_probe = auto_scene_actions_module.probe_scene
+            old_generate = auto_scene_actions_module.generate_semantic_plan
+            old_send = auto_scene_actions_module.send_actions
+            auto_scene_actions_module.probe_scene = lambda *args, **kwargs: probe
+            auto_scene_actions_module.generate_semantic_plan = lambda *args, **kwargs: ("{}", semantic_plan, None)
+            auto_scene_actions_module.send_actions = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("should not send"))
+            try:
+                args = auto_scene_actions_module.parse_args(
+                    [
+                        "--execute-actions-url",
+                        "http://127.0.0.1:1/execute_actions",
+                        "--task",
+                        "Pick up the banana.",
+                        "--task-id",
+                        "task-1",
+                        "--output-dir",
+                        temp_dir,
+                        "--relay-mode",
+                        "--relay-strategy",
+                        "rules",
+                    ]
+                )
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(io.StringIO()):
+                    exit_code = auto_scene_actions_module.run(args)
+            finally:
+                auto_scene_actions_module.probe_scene = old_probe
+                auto_scene_actions_module.generate_semantic_plan = old_generate
+                auto_scene_actions_module.send_actions = old_send
+
+        self.assertEqual(exit_code, 0)
+        output = json.loads(stdout.getvalue())
+        self.assertEqual(output["relay_result"]["status"], "needs_upstream_planning")
+        self.assertIn("not visible", output["relay_result"]["reason"])
+        self.assertNotIn("payload", output)
+
+    def test_relay_mode_dry_run_builds_payload_without_send(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            probe = {
+                "state": {
+                    "objects": [{"id": "Apple|1", "type": "Apple", "visible": True, "pickupable": True}],
+                },
+                "image_base64": "eA==",
+            }
+            semantic_plan = {
+                "task": "Pick up the apple.",
+                "targetObjectType": "Apple",
+                "needsGrounding": True,
+                "observations": [],
+                "plan": [{"action": "PickupObject", "objectType": "Apple", "targetType": None}],
+            }
+            old_probe = auto_scene_actions_module.probe_scene
+            old_generate = auto_scene_actions_module.generate_semantic_plan
+            old_send = auto_scene_actions_module.send_actions
+            auto_scene_actions_module.probe_scene = lambda *args, **kwargs: probe
+            auto_scene_actions_module.generate_semantic_plan = lambda *args, **kwargs: ("{}", semantic_plan, None)
+            auto_scene_actions_module.send_actions = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("should not send"))
+            try:
+                args = auto_scene_actions_module.parse_args(
+                    [
+                        "--execute-actions-url",
+                        "http://127.0.0.1:1/execute_actions",
+                        "--task",
+                        "Pick up the apple.",
+                        "--task-id",
+                        "task-1",
+                        "--output-dir",
+                        temp_dir,
+                        "--relay-mode",
+                        "--relay-strategy",
+                        "rules",
+                        "--dry-run",
+                    ]
+                )
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(io.StringIO()):
+                    exit_code = auto_scene_actions_module.run(args)
+            finally:
+                auto_scene_actions_module.probe_scene = old_probe
+                auto_scene_actions_module.generate_semantic_plan = old_generate
+                auto_scene_actions_module.send_actions = old_send
+
+        self.assertEqual(exit_code, 0)
+        output = json.loads(stdout.getvalue())
+        self.assertEqual(output["payload"]["robot_id"], 0)
+
+
+
+    def test_closed_loop_put_primary_holder_skips_ownership_probe_and_relay_backend(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            probe = {
+                "sceneName": "FloorPlan1",
+                "selected_robot_id": 0,
+                "robots": [
+                    {
+                        "robot_id": 0,
+                        "held_object": {"objectId": "Tomato|1", "objectType": "Tomato"},
+                        "inventory": [{"objectId": "Tomato|1", "objectType": "Tomato"}],
+                    },
+                    {"robot_id": 2},
+                ],
+                "objects": [
+                    {"id": "CounterTop|0", "type": "CounterTop", "visible": True, "receptacle": True},
+                    {"id": "Tomato|1", "type": "Tomato", "visible": False, "pickupable": True},
+                ],
+                "image_base64": "eA==",
+            }
+            put_plan = {
+                "task": "put the tomato on the countertop.",
+                "targetObjectType": "Tomato",
+                "needsGrounding": True,
+                "observations": [],
+                "plan": [{"action": "PutObject", "objectType": "Tomato", "targetType": "CounterTop"}],
+            }
+
+            class FailingRelayBackend:
+                def generate_messages(self, *args, **kwargs):
+                    raise AssertionError("primary PutObject fast path should not call relay backend")
+
+            def fake_put_intent(args, available_types):
+                tool_call = {"name": "extract_task_intent", "arguments": {"task": args.task}}
+                intent = {
+                    "requestedAction": "PutObject",
+                    "requestedObjectType": "Tomato",
+                    "intentSteps": [
+                        {"order": 1, "action": "PutObject", "objectType": "Tomato", "targetType": "CounterTop"}
+                    ],
+                }
+                return tool_call, intent, {"status": "ok", "warnings": []}
+
+            old_probe = auto_scene_actions_module.probe_scene
+            old_execute_probe = auto_scene_actions_module.execute_actions_probe_scene
+            old_generate = auto_scene_actions_module.generate_semantic_plan
+            old_intent = auto_scene_actions_module.generate_task_intent_tool_call
+            old_send = auto_scene_actions_module.send_actions
+            auto_scene_actions_module.probe_scene = lambda *args, **kwargs: probe
+            auto_scene_actions_module.execute_actions_probe_scene = lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("primary PutObject fast path should not probe peer robots")
+            )
+            auto_scene_actions_module.generate_semantic_plan = lambda *args, **kwargs: ("{}", put_plan, None)
+            auto_scene_actions_module.generate_task_intent_tool_call = fake_put_intent
+            auto_scene_actions_module.send_actions = lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("dry run should not send actions")
+            )
+            try:
+                args = auto_scene_actions_module.parse_args(
+                    [
+                        "--execute-actions-url",
+                        "http://127.0.0.1:1/execute_actions",
+                        "--task",
+                        "put the tomato on the counter.",
+                        "--task-id",
+                        "task-1",
+                        "--output-dir",
+                        temp_dir,
+                        "--relay-mode",
+                        "--relay-strategy",
+                        "agent",
+                        "--primary-robot-id",
+                        "0",
+                        "--closed-loop-replan",
+                        "--dry-run",
+                    ]
+                )
+                args._qwen_backend = FailingRelayBackend()
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(io.StringIO()):
+                    exit_code = auto_scene_actions_module.run(args)
+            finally:
+                auto_scene_actions_module.probe_scene = old_probe
+                auto_scene_actions_module.execute_actions_probe_scene = old_execute_probe
+                auto_scene_actions_module.generate_semantic_plan = old_generate
+                auto_scene_actions_module.generate_task_intent_tool_call = old_intent
+                auto_scene_actions_module.send_actions = old_send
+
+        self.assertEqual(exit_code, 0)
+        output = json.loads(stdout.getvalue())
+        self.assertEqual(output["queried_robot_ids"], [0])
+        self.assertEqual(output["closed_loop_result"]["status"], "success")
+        self.assertEqual(output["closed_loop_trace"][0]["relay_result"]["strategy"], "primary_fast_path")
+        self.assertEqual(output["closed_loop_trace"][0]["executor_robot_id"], 0)
+        self.assertEqual(
+            output["step_payloads"][0]["actions"],
+            [{"action": "PutObject", "objectId": "CounterTop|0", "forceAction": True}],
+        )
+        self.assertEqual(output["step_payloads"][0]["robot_id"], 0)
+
+    def test_closed_loop_agent_strategy_primary_fast_path_skips_relay_backend(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            probe = {
+                "sceneName": "FloorPlan1",
+                "selected_robot_id": 0,
+                "robots": [{"robot_id": 0}, {"robot_id": 1}, {"robot_id": 2}],
+                "objects": [{"id": "Tomato|1", "type": "Tomato", "visible": True, "pickupable": True}],
+                "image_base64": "eA==",
+            }
+            semantic_plan = {
+                "task": "Pick up the tomato.",
+                "targetObjectType": "Tomato",
+                "needsGrounding": True,
+                "observations": [],
+                "plan": [{"action": "PickupObject", "objectType": "Tomato", "targetType": None}],
+            }
+
+            class FailingRelayBackend:
+                def generate_messages(self, *args, **kwargs):
+                    raise AssertionError("primary fast path should not call relay backend")
+
+            old_probe = auto_scene_actions_module.probe_scene
+            old_execute_probe = auto_scene_actions_module.execute_actions_probe_scene
+            old_generate = auto_scene_actions_module.generate_semantic_plan
+            auto_scene_actions_module.probe_scene = lambda *args, **kwargs: probe
+            auto_scene_actions_module.execute_actions_probe_scene = lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("primary fast path should not probe peer robots")
+            )
+            auto_scene_actions_module.generate_semantic_plan = lambda *args, **kwargs: ("{}", semantic_plan, None)
+            try:
+                args = auto_scene_actions_module.parse_args(
+                    [
+                        "--execute-actions-url",
+                        "http://127.0.0.1:1/execute_actions",
+                        "--task",
+                        "Pick up the tomato.",
+                        "--task-id",
+                        "task-1",
+                        "--output-dir",
+                        temp_dir,
+                        "--relay-mode",
+                        "--relay-strategy",
+                        "agent",
+                        "--closed-loop-replan",
+                        "--dry-run",
+                    ]
+                )
+                args._qwen_backend = FailingRelayBackend()
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(io.StringIO()):
+                    exit_code = auto_scene_actions_module.run(args)
+            finally:
+                auto_scene_actions_module.probe_scene = old_probe
+                auto_scene_actions_module.execute_actions_probe_scene = old_execute_probe
+                auto_scene_actions_module.generate_semantic_plan = old_generate
+
+        self.assertEqual(exit_code, 0)
+        output = json.loads(stdout.getvalue())
+        self.assertEqual(output["closed_loop_result"]["status"], "success")
+        self.assertEqual(output["closed_loop_trace"][0]["relay_result"]["strategy"], "primary_fast_path")
+        self.assertEqual(output["closed_loop_trace"][0]["executor_robot_id"], 0)
+        self.assertEqual(output["step_payloads"][0]["robot_id"], 0)
+        self.assertEqual(output["queried_robot_ids"], [0])
+
+    def test_navigation_only_intent_extracts_object_type(self) -> None:
+        self.assertEqual(
+            auto_scene_actions_module.navigation_object_type_for_task("go to the fridge.", ["Fridge"]),
+            "Fridge",
+        )
+        self.assertEqual(
+            auto_scene_actions_module.navigation_object_type_for_task("move to the counter", ["CounterTop"]),
+            "CounterTop",
+        )
+        self.assertEqual(
+            auto_scene_actions_module.navigation_object_type_for_task("walk to the tomato", ["Tomato"]),
+            "Tomato",
+        )
+
+    def test_interaction_task_does_not_trigger_navigation_only_intent(self) -> None:
+        self.assertIsNone(
+            auto_scene_actions_module.navigation_object_type_for_task(
+                "put the tomato on the counter.",
+                ["Tomato", "CounterTop"],
+            )
+        )
+
+    def test_goto_url_from_execute_actions_url(self) -> None:
+        self.assertEqual(
+            auto_scene_actions_module.goto_url_from_execute_actions_url(
+                "http://host:19000/execute_actions",
+                "/goto",
+            ),
+            "http://host:19000/goto",
+        )
+
+    def test_post_json_returns_json_body_for_http_error(self) -> None:
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:  # noqa: N802
+                body = json.dumps(
+                    {
+                        "status": "failed",
+                        "error_code": "no_path",
+                        "error": "no path between start and goal",
+                    }
+                ).encode("utf-8")
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, format: str, *args) -> None:  # noqa: A003
+                return
+
+        server = HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            response = auto_scene_actions_module.post_json(
+                f"http://127.0.0.1:{server.server_port}/goto",
+                {"execute": True},
+                5,
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+        self.assertEqual(response["status"], "failed")
+        self.assertEqual(response["error_code"], "no_path")
+        self.assertEqual(response["_http_status"], 400)
+
+    def test_goto_summary_extracts_replan_trace_failed_action(self) -> None:
+        summary = auto_scene_actions_module.summarize_goto_result(
+            {
+                "status": "failed",
+                "error_code": "execution_failed_after_replans",
+                "error": "navigation action execution failed after replanning",
+                "replan_count": 3,
+                "replan_trace": [
+                    {
+                        "dynamic_obstacles": [{"robot_id": 0, "blocked_node_count": 2}],
+                        "segments": [
+                            {
+                                "failed_action": {
+                                    "index": 6,
+                                    "action": "MoveAhead",
+                                    "error": "Agent 0 is blocking Agent 1",
+                                }
+                            }
+                        ],
+                    }
+                ],
+                "dynamic_obstacles": [{"robot_id": 0, "name": "Robot0", "blocked_node_count": 2}],
+            }
+        )
+
+        self.assertEqual(summary["failed_action"]["action"], "MoveAhead")
+        self.assertIn("blocking", summary["failed_action"]["error"])
+        self.assertEqual(summary["replan_count"], 3)
+        self.assertEqual(summary["dynamic_obstacle_count"], 1)
+
+    def test_navigation_only_run_calls_goto_without_qwen(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            probe = {
+                "sceneName": "FloorPlan1",
+                "selected_robot_id": 1,
+                "robots": [{"robot_id": 0}, {"robot_id": 1}],
+                "objects": [{"id": "Fridge|1", "type": "Fridge", "visible": False}],
+                "image_base64": "eA==",
+                "results": [{"robot_id": 1, "image_base64": "eA=="}],
+                "state": {
+                    "sceneName": "FloorPlan1",
+                    "selected_robot_id": 1,
+                    "robots": [{"robot_id": 0}, {"robot_id": 1}],
+                    "objects": [{"id": "Fridge|1", "type": "Fridge", "visible": False}],
+                },
+            }
+            captured: dict[str, object] = {}
+            old_probe = auto_scene_actions_module.probe_scene
+            old_post_json = auto_scene_actions_module.post_json
+            old_generate_intent = auto_scene_actions_module.generate_task_intent_tool_call
+            auto_scene_actions_module.probe_scene = lambda *args, **kwargs: probe
+
+            def fake_post_json(url, payload, timeout):
+                captured["url"] = url
+                captured["payload"] = payload
+                return {
+                    "status": "success",
+                    "robot_id": payload["robot_id"],
+                    "planner": "reachable_positions_astar",
+                    "actions": [{"action": "MoveAhead"}],
+                    "execute": payload["execute"],
+                    "goal_position": {"x": 0.0, "y": 0.9, "z": 1.0},
+                    "post_target_visible": True,
+                    "post_target_object_id": "Fridge|1",
+                    "execute_result": {"status": "success", "results": []},
+                }
+
+            auto_scene_actions_module.post_json = fake_post_json
+            auto_scene_actions_module.generate_task_intent_tool_call = lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("navigation-only task must not call Qwen intent extraction")
+            )
+            try:
+                args = auto_scene_actions_module.parse_args(
+                    [
+                        "--execute-actions-url",
+                        "http://127.0.0.1:19000/execute_actions",
+                        "--task",
+                        "go to the fridge.",
+                        "--task-id",
+                        "goto-task-1",
+                        "--primary-robot-id",
+                        "1",
+                        "--output-dir",
+                        temp_dir,
+                        "--relay-mode",
+                        "--closed-loop-replan",
+                        "--goto-max-actions",
+                        "40",
+                        "--goto-min-distance",
+                        "0.75",
+                        "--goto-max-distance",
+                        "2.0",
+                    ]
+                )
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(io.StringIO()):
+                    exit_code = auto_scene_actions_module.run(args)
+            finally:
+                auto_scene_actions_module.probe_scene = old_probe
+                auto_scene_actions_module.post_json = old_post_json
+                auto_scene_actions_module.generate_task_intent_tool_call = old_generate_intent
+
+        output = json.loads(stdout.getvalue())
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(captured["url"], "http://127.0.0.1:19000/goto")
+        self.assertEqual(
+            captured["payload"],
+            {
+                "task_id": "goto-task-1",
+                "robot_id": 1,
+                "object_type": "Fridge",
+                "execute": True,
+                "require_target_visible": True,
+                "max_actions": 40,
+                "min_distance": 0.75,
+                "max_distance": 2.0,
+            },
+        )
+        self.assertEqual(output["task_intent_source"], "navigation_goto_intent")
+        self.assertEqual(output["closed_loop_result"], {"status": "success", "strategy": "goto"})
+        self.assertEqual(output["goto_result_summary"]["action_count"], 1)
+
+
+    def test_external_goto_intent_calls_goto_without_semantic_planning(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            probe = {
+                "sceneName": "FloorPlan1",
+                "selected_robot_id": 0,
+                "robots": [{"robot_id": 0}, {"robot_id": 1}],
+                "objects": [{"id": "Fridge|1", "type": "Fridge", "visible": True}],
+                "image_base64": "eA==",
+                "results": [{"robot_id": 0, "image_base64": "eA=="}],
+                "state": {
+                    "sceneName": "FloorPlan1",
+                    "selected_robot_id": 0,
+                    "robots": [{"robot_id": 0}, {"robot_id": 1}],
+                    "objects": [{"id": "Fridge|1", "type": "Fridge", "visible": True}],
+                },
+            }
+            captured: dict[str, object] = {}
+            old_probe = auto_scene_actions_module.probe_scene
+            old_post_json = auto_scene_actions_module.post_json
+            old_generate_plan = auto_scene_actions_module.generate_semantic_plan
+            auto_scene_actions_module.probe_scene = lambda *args, **kwargs: probe
+
+            def fake_post_json(url, payload, timeout):
+                captured["url"] = url
+                captured["payload"] = payload
+                return {
+                    "status": "success",
+                    "robot_id": payload["robot_id"],
+                    "planner": "reachable_positions_astar",
+                    "actions": [{"action": "MoveAhead"}],
+                    "execute": payload["execute"],
+                    "goal_position": {"x": 0.0, "y": 0.9, "z": 1.0},
+                    "post_target_visible": True,
+                    "post_target_object_id": "Fridge|1",
+                    "execute_result": {"status": "success", "results": []},
+                }
+
+            auto_scene_actions_module.post_json = fake_post_json
+            auto_scene_actions_module.generate_semantic_plan = lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("external GotoObject intent must use /goto, not semantic planning")
+            )
+            try:
+                task_intent_json = json.dumps(
+                    {
+                        "task_intent_source": "qwen_normalizer_tool_call",
+                        "task_intent": {
+                            "requestedAction": "GotoObject",
+                            "requestedObjectType": "Fridge",
+                            "requestedTargetType": None,
+                            "intentSteps": [
+                                {"order": 1, "action": "GotoObject", "objectType": "Fridge", "targetType": None}
+                            ],
+                        },
+                    }
+                )
+                args = auto_scene_actions_module.parse_args(
+                    [
+                        "--execute-actions-url",
+                        "http://127.0.0.1:19000/execute_actions",
+                        "--task",
+                        "Search the environment for the Fridge",
+                        "--task-id",
+                        "external-goto-task-1",
+                        "--task-intent-json",
+                        task_intent_json,
+                        "--primary-robot-id",
+                        "0",
+                        "--output-dir",
+                        temp_dir,
+                        "--relay-mode",
+                        "--closed-loop-replan",
+                    ]
+                )
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(io.StringIO()):
+                    exit_code = auto_scene_actions_module.run(args)
+            finally:
+                auto_scene_actions_module.probe_scene = old_probe
+                auto_scene_actions_module.post_json = old_post_json
+                auto_scene_actions_module.generate_semantic_plan = old_generate_plan
+
+        output = json.loads(stdout.getvalue())
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(captured["url"], "http://127.0.0.1:19000/goto")
+        self.assertEqual(captured["payload"]["object_type"], "Fridge")
+        self.assertEqual(output["task_intent_source"], "qwen_normalizer_tool_call")
+        self.assertEqual(output["closed_loop_result"], {"status": "success", "strategy": "goto"})
+
+
+    def test_external_multi_step_goto_intent_continues_after_goto(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            probe = {
+                "sceneName": "FloorPlan1",
+                "selected_robot_id": 0,
+                "robots": [{"robot_id": 0}, {"robot_id": 1}],
+                "objects": [
+                    {"id": "Sink|1", "objectId": "Sink|1", "type": "Sink", "visible": True},
+                    {"id": "SinkBasin|1", "objectId": "SinkBasin|1", "type": "SinkBasin", "visible": True, "receptacle": True},
+                ],
+                "image_base64": "eA==",
+                "results": [{"robot_id": 0, "image_base64": "eA=="}],
+                "state": {
+                    "sceneName": "FloorPlan1",
+                    "selected_robot_id": 0,
+                    "robots": [{"robot_id": 0}, {"robot_id": 1}],
+                    "objects": [
+                        {"id": "Sink|1", "objectId": "Sink|1", "type": "Sink", "visible": True},
+                        {"id": "SinkBasin|1", "objectId": "SinkBasin|1", "type": "SinkBasin", "visible": True, "receptacle": True},
+                    ],
+                },
+            }
+            captured_goto: dict[str, object] = {}
+            sent_payloads: list[dict[str, object]] = []
+            old_probe = auto_scene_actions_module.probe_scene
+            old_post_json = auto_scene_actions_module.post_json
+            old_generate_plan = auto_scene_actions_module.generate_semantic_plan
+            old_send_actions = auto_scene_actions_module.send_actions
+            auto_scene_actions_module.probe_scene = lambda *args, **kwargs: probe
+
+            def fake_post_json(url, payload, timeout):
+                captured_goto["url"] = url
+                captured_goto["payload"] = payload
+                return {
+                    "status": "success",
+                    "robot_id": payload["robot_id"],
+                    "planner": "reachable_positions_astar",
+                    "actions": [{"action": "MoveAhead"}],
+                    "execute": payload["execute"],
+                    "goal_position": {"x": 0.0, "y": 0.9, "z": 1.0},
+                    "post_target_visible": True,
+                    "post_target_object_id": "Sink|1",
+                    "execute_result": {"status": "success", "results": []},
+                }
+
+            def fake_generate_plan(args, image_path, objects, task_id):
+                return (
+                    "",
+                    {
+                        "task": args.task,
+                        "targetObjectType": None,
+                        "needsGrounding": False,
+                        "observations": [],
+                        "plan": [{"action": "RotateRight", "objectType": None, "targetType": None}],
+                    },
+                    None,
+                )
+
+            def fake_send_actions(url, payload, timeout):
+                sent_payloads.append(payload)
+                return json.dumps(
+                    {
+                        "status": "success",
+                        "results": [
+                            {
+                                "index": 0,
+                                "action": payload["actions"][0]["action"],
+                                "success": True,
+                                "robot_id": payload.get("robot_id", 0),
+                            }
+                        ],
+                    }
+                )
+
+            auto_scene_actions_module.post_json = fake_post_json
+            auto_scene_actions_module.generate_semantic_plan = fake_generate_plan
+            auto_scene_actions_module.send_actions = fake_send_actions
+            try:
+                task_intent_json = json.dumps(
+                    {
+                        "task_intent_source": "qwen_normalizer_tool_call",
+                        "task_intent": {
+                            "requestedAction": "GotoObject",
+                            "requestedObjectType": "Sink",
+                            "requestedTargetType": None,
+                            "intentSteps": [
+                                {"order": 1, "action": "GotoObject", "objectType": "Sink", "targetType": None},
+                                {"order": 2, "action": "RotateRight", "objectType": None, "targetType": None},
+                            ],
+                        },
+                    }
+                )
+                args = auto_scene_actions_module.parse_args(
+                    [
+                        "--execute-actions-url",
+                        "http://127.0.0.1:19000/execute_actions",
+                        "--task",
+                        "go to the sink and rotate right.",
+                        "--task-id",
+                        "external-goto-rotate-task-1",
+                        "--task-intent-json",
+                        task_intent_json,
+                        "--primary-robot-id",
+                        "0",
+                        "--output-dir",
+                        temp_dir,
+                        "--relay-mode",
+                        "--closed-loop-replan",
+                    ]
+                )
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(io.StringIO()):
+                    exit_code = auto_scene_actions_module.run(args)
+            finally:
+                auto_scene_actions_module.probe_scene = old_probe
+                auto_scene_actions_module.post_json = old_post_json
+                auto_scene_actions_module.generate_semantic_plan = old_generate_plan
+                auto_scene_actions_module.send_actions = old_send_actions
+
+        output = json.loads(stdout.getvalue())
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(captured_goto["url"], "http://127.0.0.1:19000/goto")
+        self.assertEqual(captured_goto["payload"]["object_type"], "Sink")
+        self.assertEqual(output["task_intent_source"], "qwen_normalizer_tool_call")
+        self.assertEqual(output["closed_loop_result"], {"status": "success", "step_count": 2})
+        self.assertEqual([entry["intent_step"]["action"] for entry in output["closed_loop_trace"]], ["GotoObject", "RotateRight"])
+        self.assertEqual(output["intent_steps"][0]["objectId"], "Sink|1")
+        self.assertEqual(
+            output["closed_loop_trace"][0]["instance_binding"]["object_id"],
+            "Sink|1",
+        )
+        self.assertEqual([payload["actions"][0]["action"] for payload in sent_payloads], ["RotateRight", "Done"])
+        self.assertEqual(output["step_payloads"][0]["actions"], [{"action": "RotateRight"}])
+
+    def test_navigation_only_goto_failure_outputs_clear_reason(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            probe = {
+                "sceneName": "FloorPlan1",
+                "selected_robot_id": 1,
+                "robots": [{"robot_id": 0}, {"robot_id": 1}],
+                "objects": [{"id": "Fridge|1", "type": "Fridge", "visible": True}],
+                "image_base64": "eA==",
+                "results": [{"robot_id": 1, "image_base64": "eA=="}],
+                "state": {
+                    "sceneName": "FloorPlan1",
+                    "selected_robot_id": 1,
+                    "robots": [{"robot_id": 0}, {"robot_id": 1}],
+                    "objects": [{"id": "Fridge|1", "type": "Fridge", "visible": True}],
+                },
+            }
+            old_probe = auto_scene_actions_module.probe_scene
+            old_post_json = auto_scene_actions_module.post_json
+            old_generate_intent = auto_scene_actions_module.generate_task_intent_tool_call
+            auto_scene_actions_module.probe_scene = lambda *args, **kwargs: probe
+
+            def fake_post_json(url, payload, timeout):
+                return {
+                    "_http_status": 400,
+                    "status": "failed",
+                    "error_code": "execution_failed_after_replans",
+                    "error": "navigation action execution failed after replanning",
+                    "replan_count": 3,
+                    "replan_trace": [
+                        {
+                            "segments": [
+                                {
+                                    "failed_action": {
+                                        "index": 30,
+                                        "action": "MoveAhead",
+                                        "error": "Agent 0 is blocking Agent 1",
+                                    }
+                                }
+                            ]
+                        }
+                    ],
+                    "dynamic_obstacles": [{"robot_id": 0, "name": "Robot0", "blocked_node_count": 4}],
+                    "execute_result": {"status": "partial", "results": []},
+                }
+
+            auto_scene_actions_module.post_json = fake_post_json
+            auto_scene_actions_module.generate_task_intent_tool_call = lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("navigation-only task must not call Qwen intent extraction")
+            )
+            try:
+                args = auto_scene_actions_module.parse_args(
+                    [
+                        "--execute-actions-url",
+                        "http://127.0.0.1:19000/execute_actions",
+                        "--task",
+                        "go to the fridge.",
+                        "--task-id",
+                        "goto-task-failed",
+                        "--primary-robot-id",
+                        "1",
+                        "--output-dir",
+                        temp_dir,
+                        "--relay-mode",
+                        "--closed-loop-replan",
+                    ]
+                )
+                stdout = io.StringIO()
+                stderr = io.StringIO()
+                with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                    exit_code = auto_scene_actions_module.run(args)
+            finally:
+                auto_scene_actions_module.probe_scene = old_probe
+                auto_scene_actions_module.post_json = old_post_json
+                auto_scene_actions_module.generate_task_intent_tool_call = old_generate_intent
+
+        output = json.loads(stdout.getvalue())
+        reason = output["closed_loop_result"]["reason"]
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(output["closed_loop_result"]["failure_code"], "execution_failed_after_replans")
+        self.assertIn("execution_failed_after_replans", reason)
+        self.assertIn("MoveAhead", reason)
+        self.assertIn("Agent 0 is blocking Agent 1", reason)
+        self.assertEqual(output["goto_result_summary"]["_http_status"], 400)
+        self.assertEqual(output["goto_result_summary"]["failed_action"]["action"], "MoveAhead")
+        self.assertIn("[goto] failed: execution_failed_after_replans", stderr.getvalue())
+
+    def test_probe_scene_uses_execute_actions_pass_with_primary_robot_id(self) -> None:
+        captured: dict[str, object] = {}
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:  # noqa: N802
+                captured["path"] = self.path
+                length = int(self.headers.get("Content-Length", "0"))
+                captured["payload"] = json.loads(self.rfile.read(length).decode("utf-8"))
+                body = json.dumps(
+                    {
+                        "status": "success",
+                        "results": [
+                            {
+                                "robot_id": 0,
+                                "robot_name": "Robot0",
+                                "action": "Pass",
+                                "success": True,
+                                "image_base64": "eA==",
+                            }
+                        ],
+                        "state": {
+                            "sceneName": "FloorPlan1",
+                            "selected_robot_id": 0,
+                            "robots": [{"robot_id": 0, "name": "Robot0"}],
+                            "objects": [{"id": "Apple|1", "type": "Apple", "visible": True, "pickupable": True}],
+                        },
+                    }
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, format: str, *args: object) -> None:
+                return
+
+        server = HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.handle_request)
+        thread.start()
+        try:
+            probe = auto_scene_actions_module.probe_scene(
+                f"http://127.0.0.1:{server.server_port}/execute_actions",
+                "task-1",
+                2.0,
+                primary_robot_id=0,
+                state_endpoint="/state",
+            )
+        finally:
+            thread.join(timeout=5)
+            server.server_close()
+
+        observations = extract_agent_observations(probe, primary_robot_id=0)
+        self.assertEqual(captured["path"], "/execute_actions")
+        self.assertEqual(captured["payload"]["robot_id"], 0)
+        self.assertEqual(captured["payload"]["actions"], [{"action": "Pass"}])
+        self.assertEqual(observations[0]["robot_id"], 0)
+        self.assertEqual(observations[0]["agent_id"], "robot_0")
+
+    def test_legacy_probe_scene_uses_execute_actions_pass(self) -> None:
+        old_post_json = auto_scene_actions_module.post_json
+        captured: dict[str, object] = {}
+
+        def fake_post_json(url, payload, timeout):
+            captured["url"] = url
+            captured["payload"] = payload
+            return {
+                "status": "success",
+                "state": {"objects": [{"id": "Egg|1", "type": "Egg", "visible": True, "pickupable": True}]},
+                "results": [{"robot_id": 0, "image_base64": "eA=="}],
+            }
+
+        auto_scene_actions_module.post_json = fake_post_json
+        try:
+            probe = auto_scene_actions_module.legacy_probe_scene(
+                "http://127.0.0.1:1/execute_actions",
+                "task-1",
+                2.0,
+            )
+        finally:
+            auto_scene_actions_module.post_json = old_post_json
+
+        self.assertEqual(captured["payload"]["actions"], [{"action": "Pass"}])
+        self.assertEqual(captured["payload"]["robot_id"], 0)
+        self.assertEqual(probe["status"], "success")
+
+    def test_relay_mode_primary_visible_does_not_observe_other_robots(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            probe = {
+                "sceneName": "FloorPlan1",
+                "selected_robot_id": 0,
+                "robots": [{"robot_id": 0}, {"robot_id": 1}],
+                "objects": [{"id": "Apple|1", "type": "Apple", "visible": True, "pickupable": True}],
+                "image_base64": "eA==",
+            }
+            semantic_plan = {
+                "task": "Pick up the apple.",
+                "targetObjectType": "Apple",
+                "needsGrounding": True,
+                "observations": [],
+                "plan": [{"action": "PickupObject", "objectType": "Apple", "targetType": None}],
+            }
+            old_probe = auto_scene_actions_module.probe_scene
+            old_generate = auto_scene_actions_module.generate_semantic_plan
+            old_observe = auto_scene_actions_module.observe_robot
+            auto_scene_actions_module.probe_scene = lambda *args, **kwargs: probe
+            auto_scene_actions_module.generate_semantic_plan = lambda *args, **kwargs: ("{}", semantic_plan, None)
+            auto_scene_actions_module.observe_robot = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("should not observe peer"))
+            try:
+                args = auto_scene_actions_module.parse_args(
+                    [
+                        "--execute-actions-url",
+                        "http://127.0.0.1:1/execute_actions",
+                        "--task",
+                        "Pick up the apple.",
+                        "--task-id",
+                        "task-1",
+                        "--output-dir",
+                        temp_dir,
+                        "--relay-mode",
+                        "--relay-strategy",
+                        "rules",
+                        "--dry-run",
+                    ]
+                )
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(io.StringIO()):
+                    exit_code = auto_scene_actions_module.run(args)
+            finally:
+                auto_scene_actions_module.probe_scene = old_probe
+                auto_scene_actions_module.generate_semantic_plan = old_generate
+                auto_scene_actions_module.observe_robot = old_observe
+
+        self.assertEqual(exit_code, 0)
+        output = json.loads(stdout.getvalue())
+        self.assertEqual(output["payload"]["robot_id"], 0)
+        self.assertEqual(output["queried_robot_ids"], [0])
+
+    def test_relay_mode_lazy_observe_selects_peer_robot(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            probe = {
+                "sceneName": "FloorPlan1",
+                "selected_robot_id": 0,
+                "robots": [{"robot_id": 0}, {"robot_id": 1}],
+                "objects": [{"id": "Egg|1", "type": "Egg", "visible": True, "pickupable": True}],
+                "image_base64": "eA==",
+            }
+            peer_observation = {
+                "status": "success",
+                "robot_id": 1,
+                "robot": {"name": "Robot1"},
+                "objects": [{"id": "Apple|1", "type": "Apple", "visible": True, "pickupable": True}],
+                "image_base64": "eA==",
+            }
+            semantic_plan = {
+                "task": "Pick up the apple.",
+                "targetObjectType": "Apple",
+                "needsGrounding": True,
+                "observations": [],
+                "plan": [{"action": "PickupObject", "objectType": "Apple", "targetType": None}],
+            }
+            observed = []
+            calls = []
+            captured = {}
+            old_probe = auto_scene_actions_module.probe_scene
+            old_execute_probe = auto_scene_actions_module.execute_actions_probe_scene
+            old_generate = auto_scene_actions_module.generate_semantic_plan
+            old_send = auto_scene_actions_module.send_actions
+            auto_scene_actions_module.probe_scene = lambda *args, **kwargs: probe
+            auto_scene_actions_module.execute_actions_probe_scene = lambda url, task_id, timeout, robot_id=0: observed.append(robot_id) or peer_observation
+            auto_scene_actions_module.generate_semantic_plan = lambda args, image_path, objects, task_id: calls.append(str(image_path)) or ("{}", semantic_plan, None)
+            def fake_send(url, payload, timeout):
+                captured["payload"] = payload
+                return json.dumps({"status": "success", "state": {"objects": []}})
+            auto_scene_actions_module.send_actions = fake_send
+            try:
+                args = auto_scene_actions_module.parse_args(
+                    [
+                        "--execute-actions-url",
+                        "http://127.0.0.1:1/execute_actions",
+                        "--task",
+                        "Pick up the apple.",
+                        "--task-id",
+                        "task-1",
+                        "--output-dir",
+                        temp_dir,
+                        "--relay-mode",
+                        "--relay-strategy",
+                        "rules",
+                    ]
+                )
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(io.StringIO()):
+                    exit_code = auto_scene_actions_module.run(args)
+            finally:
+                auto_scene_actions_module.probe_scene = old_probe
+                auto_scene_actions_module.execute_actions_probe_scene = old_execute_probe
+                auto_scene_actions_module.generate_semantic_plan = old_generate
+                auto_scene_actions_module.send_actions = old_send
+
+        self.assertEqual(exit_code, 0)
+        output = json.loads(stdout.getvalue())
+        self.assertEqual(observed, [1])
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(output["executor_robot_id"], 1)
+        self.assertEqual(output["executor_agent_id"], "robot_1")
+        self.assertEqual(captured["payload"]["robot_id"], 1)
+        self.assertEqual(captured["payload"]["actions"][0]["objectId"], "Apple|1")
+
+    def test_relay_mode_discovers_global_robot_ids_when_primary_state_is_local_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            probe = {
+                "sceneName": "FloorPlan1",
+                "selected_robot_id": 1,
+                "objects": [{"id": "Fridge|1", "type": "Fridge", "visible": False, "openable": True}],
+                "image_base64": "eA==",
+            }
+            global_state = {"robots": [{"robot_id": 0}, {"robot_id": 1}]}
+            robot0_observation = {
+                "status": "success",
+                "robot_id": 0,
+                "robot": {"name": "Robot0"},
+                "objects": [{"id": "Fridge|1", "type": "Fridge", "visible": True, "openable": True}],
+                "image_base64": "eA==",
+            }
+            primary_plan = {
+                "task": "Close the fridge.",
+                "targetObjectType": "Fridge",
+                "needsGrounding": True,
+                "observations": [],
+                "plan": [{"action": "CloseObject", "objectType": "Fridge", "targetType": None}],
+            }
+            observed = []
+            calls = []
+            captured = {}
+            old_probe = auto_scene_actions_module.probe_scene
+            old_global_state = auto_scene_actions_module.get_global_state
+            old_execute_probe = auto_scene_actions_module.execute_actions_probe_scene
+            old_generate = auto_scene_actions_module.generate_semantic_plan
+            old_send = auto_scene_actions_module.send_actions
+            auto_scene_actions_module.probe_scene = lambda *args, **kwargs: probe
+            auto_scene_actions_module.get_global_state = lambda *args, **kwargs: global_state
+            auto_scene_actions_module.execute_actions_probe_scene = lambda url, task_id, timeout, robot_id=0: observed.append(robot_id) or robot0_observation
+            auto_scene_actions_module.generate_semantic_plan = lambda args, image_path, objects, task_id: calls.append(str(image_path)) or ("{}", primary_plan, None)
+            def fake_send(url, payload, timeout):
+                captured["payload"] = payload
+                return json.dumps({"status": "success", "state": {"objects": []}})
+            auto_scene_actions_module.send_actions = fake_send
+            try:
+                args = auto_scene_actions_module.parse_args(
+                    [
+                        "--execute-actions-url",
+                        "http://127.0.0.1:1/execute_actions",
+                        "--task",
+                        "Close the fridge.",
+                        "--task-id",
+                        "task-1",
+                        "--output-dir",
+                        temp_dir,
+                        "--relay-mode",
+                        "--relay-strategy",
+                        "rules",
+                        "--primary-robot-id",
+                        "1",
+                    ]
+                )
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(io.StringIO()):
+                    exit_code = auto_scene_actions_module.run(args)
+            finally:
+                auto_scene_actions_module.probe_scene = old_probe
+                auto_scene_actions_module.get_global_state = old_global_state
+                auto_scene_actions_module.execute_actions_probe_scene = old_execute_probe
+                auto_scene_actions_module.generate_semantic_plan = old_generate
+                auto_scene_actions_module.send_actions = old_send
+
+        self.assertEqual(exit_code, 0)
+        output = json.loads(stdout.getvalue())
+        self.assertEqual(output["known_robot_ids"], [0, 1])
+        self.assertEqual(output["queried_robot_ids"], [1, 0])
+        self.assertEqual(output["robot_discovery_source"], "global_state_fallback")
+        self.assertEqual(observed, [0])
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(output["executor_robot_id"], 0)
+        self.assertEqual(captured["payload"]["robot_id"], 0)
+        self.assertEqual(captured["payload"]["actions"][0]["objectId"], "Fridge|1")
+
+    def test_relay_mode_global_discovery_failure_keeps_observed_robot_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            probe = {
+                "selected_robot_id": 1,
+                "robots": [{"robot_id": 1}],
+                "objects": [{"id": "Fridge|1", "type": "Fridge", "visible": False, "openable": True}],
+                "image_base64": "eA==",
+            }
+            semantic_plan = {
+                "task": "Close the fridge.",
+                "targetObjectType": "Fridge",
+                "needsGrounding": True,
+                "observations": [],
+                "plan": [{"action": "CloseObject", "objectType": "Fridge", "targetType": None}],
+            }
+            observed = []
+            old_probe = auto_scene_actions_module.probe_scene
+            old_global_state = auto_scene_actions_module.get_global_state
+            old_execute_probe = auto_scene_actions_module.execute_actions_probe_scene
+            old_generate = auto_scene_actions_module.generate_semantic_plan
+            old_send = auto_scene_actions_module.send_actions
+            auto_scene_actions_module.probe_scene = lambda *args, **kwargs: probe
+            auto_scene_actions_module.get_global_state = lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("no global state"))
+            auto_scene_actions_module.execute_actions_probe_scene = lambda *args, **kwargs: observed.append(kwargs.get("robot_id"))
+            auto_scene_actions_module.generate_semantic_plan = lambda *args, **kwargs: ("{}", semantic_plan, None)
+            auto_scene_actions_module.send_actions = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("should not send"))
+            try:
+                args = auto_scene_actions_module.parse_args(
+                    [
+                        "--execute-actions-url",
+                        "http://127.0.0.1:1/execute_actions",
+                        "--task",
+                        "Close the fridge.",
+                        "--task-id",
+                        "task-1",
+                        "--output-dir",
+                        temp_dir,
+                        "--relay-mode",
+                        "--relay-strategy",
+                        "rules",
+                        "--primary-robot-id",
+                        "1",
+                    ]
+                )
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(io.StringIO()):
+                    exit_code = auto_scene_actions_module.run(args)
+            finally:
+                auto_scene_actions_module.probe_scene = old_probe
+                auto_scene_actions_module.get_global_state = old_global_state
+                auto_scene_actions_module.execute_actions_probe_scene = old_execute_probe
+                auto_scene_actions_module.generate_semantic_plan = old_generate
+                auto_scene_actions_module.send_actions = old_send
+
+        self.assertEqual(exit_code, 0)
+        output = json.loads(stdout.getvalue())
+        self.assertEqual(output["known_robot_ids"], [1])
+        self.assertEqual(output["queried_robot_ids"], [1])
+        self.assertEqual(output["robot_discovery_source"], "execute_actions_state")
+        self.assertEqual(output["relay_result"]["status"], "needs_upstream_planning")
+        self.assertEqual(observed, [])
+
+    def test_known_robot_ids_limits_lazy_observe(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            probe = {
+                "selected_robot_id": 0,
+                "robots": [{"robot_id": 0}, {"robot_id": 1}, {"robot_id": 2}],
+                "objects": [{"id": "Egg|1", "type": "Egg", "visible": True, "pickupable": True}],
+                "image_base64": "eA==",
+            }
+            semantic_plan = {
+                "task": "Pick up the banana.",
+                "targetObjectType": "Banana",
+                "needsGrounding": True,
+                "observations": [],
+                "plan": [{"action": "PickupObject", "objectType": "Banana", "targetType": None}],
+            }
+            observed = []
+            old_probe = auto_scene_actions_module.probe_scene
+            old_execute_probe = auto_scene_actions_module.execute_actions_probe_scene
+            old_generate = auto_scene_actions_module.generate_semantic_plan
+            old_send = auto_scene_actions_module.send_actions
+            auto_scene_actions_module.probe_scene = lambda *args, **kwargs: probe
+            auto_scene_actions_module.execute_actions_probe_scene = lambda url, task_id, timeout, robot_id=0: observed.append(robot_id) or {
+                "robot_id": robot_id,
+                "objects": [{"id": f"Mug|{robot_id}", "type": "Mug", "visible": True, "pickupable": True}],
+                "image_base64": "eA==",
+            }
+            auto_scene_actions_module.generate_semantic_plan = lambda *args, **kwargs: ("{}", semantic_plan, None)
+            auto_scene_actions_module.send_actions = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("should not send"))
+            try:
+                args = auto_scene_actions_module.parse_args(
+                    [
+                        "--execute-actions-url",
+                        "http://127.0.0.1:1/execute_actions",
+                        "--task",
+                        "Pick up the banana.",
+                        "--task-id",
+                        "task-1",
+                        "--output-dir",
+                        temp_dir,
+                        "--relay-mode",
+                        "--relay-strategy",
+                        "rules",
+                        "--known-robot-ids",
+                        "0,2",
+                    ]
+                )
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(io.StringIO()):
+                    exit_code = auto_scene_actions_module.run(args)
+            finally:
+                auto_scene_actions_module.probe_scene = old_probe
+                auto_scene_actions_module.execute_actions_probe_scene = old_execute_probe
+                auto_scene_actions_module.generate_semantic_plan = old_generate
+                auto_scene_actions_module.send_actions = old_send
+
+        self.assertEqual(exit_code, 0)
+        output = json.loads(stdout.getvalue())
+        self.assertEqual(observed, [2])
+        self.assertEqual(output["known_robot_ids"], [0, 2])
+        self.assertEqual(output["relay_result"]["status"], "needs_upstream_planning")
+
+
+
+class GoalConsistencyVerifierTest(unittest.TestCase):
+    def test_extracts_requested_object_from_common_types(self) -> None:
+        self.assertEqual(extract_requested_object_type("Pick up the apple.", ["Egg", "Fridge"]), "Apple")
+
+    def test_rejects_unseen_model_target_object(self) -> None:
+        semantic_plan = {"targetObjectType": "Banana", "plan": [{"action": "Done", "objectType": "Egg", "targetType": None}]}
+        objects = [
+            {"id": "Egg|1", "type": "Egg", "visible": True, "pickupable": True},
+            {"id": "Fridge|1", "type": "Fridge", "visible": True, "openable": True},
+        ]
+
+        with self.assertRaisesRegex(ValueError, "Banana.*visible categories: Egg, Fridge"):
+            validate_goal_consistency("Pick up the banana.", semantic_plan, objects)
+
+    def test_rejects_substituted_plan_object(self) -> None:
+        semantic_plan = {"targetObjectType": "Apple", "plan": [{"action": "PickupObject", "objectType": "Egg", "targetType": None}]}
+        objects = [
+            {"id": "Apple|1", "type": "Apple", "visible": True, "pickupable": True},
+            {"id": "Egg|1", "type": "Egg", "visible": True, "pickupable": True},
+        ]
+
+        with self.assertRaisesRegex(ValueError, "does not match requested object"):
+            validate_goal_consistency("Pick up the apple.", semantic_plan, objects)
+
+    def test_rejects_requested_object_when_not_visible(self) -> None:
+        semantic_plan = {"targetObjectType": "Apple", "plan": [{"action": "PickupObject", "objectType": "Egg", "targetType": None}]}
+        objects = [
+            {"id": "Egg|1", "type": "Egg", "visible": True, "pickupable": True},
+            {"id": "Fridge|1", "type": "Fridge", "visible": True, "openable": True},
+        ]
+
+        with self.assertRaisesRegex(ValueError, "Apple.*visible categories: Egg, Fridge"):
+            validate_goal_consistency("Pick up the apple.", semantic_plan, objects)
+
+    def test_allows_matching_requested_object(self) -> None:
+        semantic_plan = {"targetObjectType": "Apple", "plan": [{"action": "PickupObject", "objectType": "Apple", "targetType": None}]}
+        objects = [{"id": "Apple|1", "type": "Apple", "visible": True, "pickupable": True}]
+
+        validate_goal_consistency("Pick up the apple.", semantic_plan, objects)
+
+    def test_allows_matching_put_object_with_different_receptacle(self) -> None:
+        semantic_plan = {"targetObjectType": "Apple", "plan": [{"action": "PutObject", "objectType": "Apple", "targetType": "CounterTop"}]}
+        objects = [
+            {"id": "Apple|1", "type": "Apple", "visible": True, "pickupable": True},
+            {"id": "CounterTop|1", "type": "CounterTop", "visible": True, "receptacle": True},
+        ]
+
+        validate_goal_consistency("Put the apple on the counter.", semantic_plan, objects)
+
+    def test_rejects_done_only_plan_for_visible_requested_object(self) -> None:
+        semantic_plan = {"targetObjectType": "Apple", "plan": [{"action": "Done", "objectType": "Apple", "targetType": None}]}
+        objects = [{"id": "Apple|1", "type": "Apple", "visible": True, "pickupable": True}]
+
+        with self.assertRaisesRegex(ValueError, "does not operate on requested object"):
+            validate_goal_consistency("Pick up the apple.", semantic_plan, objects)
+
+    def test_ignores_tasks_without_explicit_object(self) -> None:
+        semantic_plan = {"targetObjectType": None, "plan": [{"action": "PickupObject", "objectType": "Egg", "targetType": None}]}
+        objects = [{"id": "Egg|1", "type": "Egg", "visible": True, "pickupable": True}]
+
+        validate_goal_consistency("Clean up the scene.", semantic_plan, objects)
+
+
+class ActionIntentVerifierTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.old_task_intent_tool_call = auto_scene_actions_module.generate_task_intent_tool_call
+        auto_scene_actions_module.generate_task_intent_tool_call = fake_task_intent_tool_call
+
+    def tearDown(self) -> None:
+        auto_scene_actions_module.generate_task_intent_tool_call = self.old_task_intent_tool_call
+
+    def test_extracts_requested_action(self) -> None:
+        self.assertEqual(extract_requested_action("Pick up the fridge."), "PickupObject")
+        self.assertEqual(extract_requested_action("Open the fridge."), "OpenObject")
+        self.assertEqual(extract_requested_action("Turn right."), "RotateRight")
+        self.assertEqual(extract_requested_action("Move right."), "MoveRight")
+        self.assertEqual(extract_requested_action("Look down."), "LookDown")
+
+    def test_rejects_turn_right_rewritten_as_move_right(self) -> None:
+        semantic_plan = {"plan": [{"action": "MoveRight", "objectType": None, "targetType": None}]}
+
+        with self.assertRaisesRegex(ValueError, "MoveRight.*RotateRight"):
+            validate_action_intent_consistency("Turn right.", semantic_plan)
+
+    def test_allows_matching_turn_right_action(self) -> None:
+        semantic_plan = {"plan": [{"action": "RotateRight", "objectType": None, "targetType": None}]}
+
+        validate_action_intent_consistency("Turn right.", semantic_plan)
+
+    def test_allows_matching_move_right_action(self) -> None:
+        semantic_plan = {"plan": [{"action": "MoveRight", "objectType": None, "targetType": None}]}
+
+        validate_action_intent_consistency("Move right.", semantic_plan)
+
+    def test_rejects_move_right_rewritten_as_rotate_right(self) -> None:
+        semantic_plan = {"plan": [{"action": "RotateRight", "objectType": None, "targetType": None}]}
+
+        with self.assertRaisesRegex(ValueError, "RotateRight.*MoveRight"):
+            validate_action_intent_consistency("Move right.", semantic_plan)
+
+    def test_allows_matching_look_down_action(self) -> None:
+        semantic_plan = {"plan": [{"action": "LookDown", "objectType": None, "targetType": None}]}
+
+        validate_action_intent_consistency("Look down.", semantic_plan)
+
+    def test_relay_dry_run_turn_right_payload_uses_rotate_right(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            probe = {
+                "sceneName": "FloorPlan1",
+                "selected_robot_id": 1,
+                "robots": [{"robot_id": 0}, {"robot_id": 1}],
+                "objects": [{"id": "Fridge|1", "type": "Fridge", "visible": True, "openable": True}],
+                "image_base64": "eA==",
+            }
+            semantic_plan = {
+                "task": "Turn right.",
+                "targetObjectType": None,
+                "needsGrounding": True,
+                "observations": [],
+                "plan": [{"action": "RotateRight", "objectType": None, "targetType": None}],
+            }
+            old_probe = auto_scene_actions_module.probe_scene
+            old_generate = auto_scene_actions_module.generate_semantic_plan
+            old_observe = auto_scene_actions_module.observe_robot
+            old_send = auto_scene_actions_module.send_actions
+            auto_scene_actions_module.probe_scene = lambda *args, **kwargs: probe
+            auto_scene_actions_module.generate_semantic_plan = lambda *args, **kwargs: ("{}", semantic_plan, None)
+            auto_scene_actions_module.observe_robot = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("should not observe peer"))
+            auto_scene_actions_module.send_actions = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("dry-run should not send"))
+            try:
+                args = auto_scene_actions_module.parse_args(
+                    [
+                        "--execute-actions-url",
+                        "http://127.0.0.1:1/execute_actions",
+                        "--task",
+                        "Turn right.",
+                        "--task-id",
+                        "task-1",
+                        "--output-dir",
+                        temp_dir,
+                        "--relay-mode",
+                        "--relay-strategy",
+                        "rules",
+                        "--primary-robot-id",
+                        "1",
+                        "--dry-run",
+                    ]
+                )
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(io.StringIO()):
+                    exit_code = auto_scene_actions_module.run(args)
+            finally:
+                auto_scene_actions_module.probe_scene = old_probe
+                auto_scene_actions_module.generate_semantic_plan = old_generate
+                auto_scene_actions_module.observe_robot = old_observe
+                auto_scene_actions_module.send_actions = old_send
+
+        self.assertEqual(exit_code, 0)
+        output = json.loads(stdout.getvalue())
+        self.assertEqual(output["payload"]["robot_id"], 1)
+        self.assertEqual(output["queried_robot_ids"], [1])
+        self.assertIs(output["payload"]["stop_on_failure"], False)
+        self.assertEqual(output["payload"]["actions"], [{"action": "RotateRight"}, {"action": "Done"}])
+
+    def test_rejects_pickup_rewritten_as_open(self) -> None:
+        semantic_plan = {"plan": [{"action": "OpenObject", "objectType": "Fridge", "targetType": None}]}
+
+        with self.assertRaisesRegex(ValueError, "OpenObject.*PickupObject"):
+            validate_action_intent_consistency("Pick up the fridge.", semantic_plan)
+
+    def test_allows_matching_pickup_action(self) -> None:
+        semantic_plan = {"plan": [{"action": "PickupObject", "objectType": "Egg", "targetType": None}]}
+
+        validate_action_intent_consistency("Pick up the egg.", semantic_plan)
+
+    def test_allows_matching_open_action(self) -> None:
+        semantic_plan = {"plan": [{"action": "OpenObject", "objectType": "Fridge", "targetType": None}]}
+
+        validate_action_intent_consistency("Open the fridge.", semantic_plan)
+
+    def test_rejects_open_rewritten_as_pickup(self) -> None:
+        semantic_plan = {"plan": [{"action": "PickupObject", "objectType": "Fridge", "targetType": None}]}
+
+        with self.assertRaisesRegex(ValueError, "PickupObject.*OpenObject"):
+            validate_action_intent_consistency("Open the fridge.", semantic_plan)
+
+    def test_ignores_tasks_without_explicit_action(self) -> None:
+        semantic_plan = {"plan": [{"action": "PickupObject", "objectType": "Egg", "targetType": None}]}
+
+        validate_action_intent_consistency("The egg on the counter.", semantic_plan)
+
+
+class ActionAffordanceVerifierTest(unittest.TestCase):
+    def test_rejects_pickup_object_for_non_pickupable_fridge(self) -> None:
+        semantic_plan = {"plan": [{"action": "PickupObject", "objectType": "Fridge", "targetType": None}]}
+        objects = [{"id": "Fridge|1", "type": "Fridge", "visible": True, "openable": True, "pickupable": False}]
+
+        with self.assertRaisesRegex(ValueError, "not pickupable.*PickupObject"):
+            validate_action_affordances(semantic_plan, objects, allow_invisible=False)
+
+    def test_allows_open_object_for_openable_fridge(self) -> None:
+        semantic_plan = {"plan": [{"action": "OpenObject", "objectType": "Fridge", "targetType": None}]}
+        objects = [{"id": "Fridge|1", "type": "Fridge", "visible": True, "openable": True}]
+
+        validate_action_affordances(semantic_plan, objects, allow_invisible=False)
+        self.assertEqual(
+            ground_semantic_plan(semantic_plan, objects, allow_invisible=False, max_actions=20),
+            [{"action": "OpenObject", "objectId": "Fridge|1", "forceAction": True}, {"action": "Done"}],
+        )
+
+    def test_allows_pickup_object_for_pickupable_egg(self) -> None:
+        semantic_plan = {"plan": [{"action": "PickupObject", "objectType": "Egg", "targetType": None}]}
+        objects = [{"id": "Egg|1", "type": "Egg", "visible": True, "pickupable": True}]
+
+        validate_action_affordances(semantic_plan, objects, allow_invisible=False)
+
+    def test_allows_put_object_into_receptacle(self) -> None:
+        semantic_plan = {"plan": [{"action": "PutObject", "objectType": "Apple", "targetType": "CounterTop"}]}
+        objects = [
+            {"id": "Apple|1", "type": "Apple", "visible": True, "pickupable": True},
+            {"id": "CounterTop|1", "type": "CounterTop", "visible": True, "receptacle": True},
+        ]
+
+        validate_action_affordances(semantic_plan, objects, allow_invisible=False)
+
+    def test_rejects_put_object_into_non_receptacle(self) -> None:
+        semantic_plan = {"plan": [{"action": "PutObject", "objectType": "Apple", "targetType": "Fridge"}]}
+        objects = [
+            {"id": "Apple|1", "type": "Apple", "visible": True, "pickupable": True},
+            {"id": "Fridge|1", "type": "Fridge", "visible": True, "openable": True, "receptacle": False},
+        ]
+
+        with self.assertRaisesRegex(ValueError, "not receptacle.*PutObject"):
+            validate_action_affordances(semantic_plan, objects, allow_invisible=False)
+
+
+class ActionStatePreconditionVerifierTest(unittest.TestCase):
+    def test_inventory_alone_does_not_define_held_object(self) -> None:
+        observations = extract_agent_observations(
+            {
+                "selected_robot_id": 0,
+                "objects": [{"id": "Apple|1", "type": "Apple", "visible": True}],
+                "inventory": [{"objectId": "Tomato|1", "objectType": "Tomato"}],
+            },
+            primary_robot_id=0,
+        )
+
+        self.assertIsNone(held_object_type_from_observation(observations[0]))
+        self.assertIsNone(agent_observations_summary(observations)[0]["held_object_type"])
+        self.assertEqual(observations[0]["inventory"], [{"objectId": "Tomato|1", "objectType": "Tomato"}])
+
+    def test_robot_proxy_alone_does_not_define_held_object(self) -> None:
+        observations = extract_agent_observations(
+            {
+                "selected_robot_id": 0,
+                "robots": [{"robot_id": 0, "proxy": {"objectId": "Mug|1", "objectType": "Mug"}}],
+                "objects": [{"id": "Mug|1", "type": "Mug", "visible": True, "pickupable": True}],
+            },
+            primary_robot_id=0,
+        )
+
+        debug = held_object_debug_from_observation(observations[0])
+
+        self.assertIsNone(held_object_type_from_observation(observations[0]))
+        self.assertIsNone(debug["held_object_source"])
+        self.assertEqual(debug["robot_state_proxy"], {"objectId": "Mug|1", "objectType": "Mug"})
+
+    def test_extracts_held_object_from_new_observe_fields(self) -> None:
+        observations = extract_agent_observations(
+            {
+                "robot_id": 0,
+                "robot": {
+                    "robot_id": 0,
+                    "held_object": {"objectId": "Tomato|1", "objectType": "Tomato"},
+                    "inventory": [{"objectId": "Tomato|1", "objectType": "Tomato"}],
+                },
+                "metadata": {
+                    "inventoryObjects": [{"objectId": "Tomato|1", "objectType": "Tomato"}],
+                },
+                "objects": [{"id": "Tomato|1", "type": "Tomato", "visible": True, "pickupable": True}],
+            },
+            primary_robot_id=0,
+        )
+
+        self.assertEqual(held_object_type_from_observation(observations[0]), "Tomato")
+        self.assertEqual(observations[0]["held_object"]["objectType"], "Tomato")
+        self.assertEqual(observations[0]["held_object_source"], "robot_state.held_object")
+        self.assertEqual(agent_observations_summary(observations)[0]["held_object_type"], "Tomato")
+
+    def test_held_object_priority_uses_robot_state_before_inventory(self) -> None:
+        observation = {
+            "agent_id": "robot_0",
+            "robot_id": 0,
+            "inventory": [{"objectId": "Pan|1", "objectType": "Pan"}],
+            "robot_state": {
+                "robot_id": 0,
+                "held_object": {"objectId": "TomatoSliced|1", "objectType": "TomatoSliced"},
+                "inventory": [{"objectId": "Pan|1", "objectType": "Pan"}],
+            },
+        }
+
+        debug = held_object_debug_from_observation(observation)
+
+        self.assertEqual(held_object_type_from_observation(observation), "TomatoSliced")
+        self.assertEqual(debug["held_object_source"], "robot_state.held_object")
+        self.assertEqual(debug["held_objects"], [{"objectId": "TomatoSliced|1", "objectType": "TomatoSliced"}])
+
+    def test_normalized_held_object_priority_ignores_conflicting_inventory(self) -> None:
+        observation = {
+            "agent_id": "robot_0",
+            "robot_id": 0,
+            "held_object": {"objectId": "TomatoSliced|1", "objectType": "TomatoSliced"},
+            "held_object_source": "robot_state.held_object",
+            "inventory": [{"objectId": "Pan|1", "objectType": "Pan"}],
+            "robot_state": {
+                "robot_id": 0,
+                "held_object": {"objectId": "TomatoSliced|1", "objectType": "TomatoSliced"},
+                "inventory": [{"objectId": "Pan|1", "objectType": "Pan"}],
+            },
+        }
+
+        debug = held_object_debug_from_observation(observation)
+
+        self.assertEqual(held_object_type_from_observation(observation), "TomatoSliced")
+        self.assertEqual(debug["held_object_source"], "robot_state.held_object")
+        self.assertEqual(debug["inventory"], [{"objectId": "Pan|1", "objectType": "Pan"}])
+
+    def test_merges_execute_result_held_object_into_observation(self) -> None:
+        observation = {
+            "agent_id": "robot_0",
+            "robot_id": 0,
+            "objects": [{"id": "Tomato|1", "type": "Tomato", "visible": True, "pickupable": True}],
+            "inventory": [],
+            "robot_state": {"robot_id": 0},
+        }
+        execute_response = {
+            "status": "success",
+            "results": [
+                {
+                    "robot_id": 0,
+                    "action": "PickupObject",
+                    "success": True,
+                    "inventory": [{"objectId": "Tomato|1", "objectType": "Tomato"}],
+                    "held_object": {"objectId": "Tomato|1", "objectType": "Tomato"},
+                    "robot": {
+                        "robot_id": 0,
+                        "held_object": {"objectId": "Tomato|1", "objectType": "Tomato"},
+                        "inventory": [{"objectId": "Tomato|1", "objectType": "Tomato"}],
+                    },
+                }
+            ],
+        }
+
+        merge_execute_result_into_observation(observation, execute_response)
+
+        self.assertEqual(held_object_type_from_observation(observation), "Tomato")
+        self.assertEqual(observation["held_object"]["objectType"], "Tomato")
+        self.assertEqual(observation["held_object_source"], "robot_state.held_object")
+
+    def test_merges_interaction_after_state_across_open_put_close_steps(self) -> None:
+        fridge_id = "Fridge|1"
+        tomato_id = "Tomato|1"
+        observation = {
+            "agent_id": "robot_0",
+            "robot_id": 0,
+            "objects": [
+                {"id": fridge_id, "type": "Fridge", "visible": True, "openable": True, "isOpen": False},
+                {"id": tomato_id, "type": "Tomato", "visible": True, "pickupable": True},
+            ],
+            "inventory": [{"objectId": tomato_id, "objectType": "Tomato"}],
+            "robot_state": {"robot_id": 0},
+        }
+
+        open_response = {
+            "status": "success",
+            "results": [{
+                "robot_id": 0,
+                "action": "OpenObject",
+                "success": True,
+                "inventory": [{"objectId": tomato_id, "objectType": "Tomato"}],
+                "interacted_objects": [{
+                    "objectId": fridge_id,
+                    "after": {"objectId": fridge_id, "objectType": "Fridge", "isOpen": True},
+                }],
+            }],
+        }
+        merge_execute_result_into_observation(observation, open_response)
+        self.assertTrue(observation["objects"][0]["isOpen"])
+        self.assertFalse(object_state_step_already_satisfied(
+            {"action": "CloseObject", "objectType": "Fridge"}, observation
+        ))
+
+        put_response = {
+            "status": "success",
+            "results": [{
+                "robot_id": 0,
+                "action": "PutObject",
+                "success": True,
+                "inventory": [],
+                "interacted_objects": [{
+                    "id": tomato_id,
+                    "after": {
+                        "id": tomato_id,
+                        "type": "Tomato",
+                        "parentReceptacles": [fridge_id],
+                        "isPickedUp": False,
+                    },
+                }],
+            }],
+        }
+        merge_execute_result_into_observation(observation, put_response)
+        self.assertEqual(observation["inventory"], [])
+        self.assertEqual(observation["objects"][1]["parentReceptacles"], [fridge_id])
+        self.assertTrue(observation["objects"][0]["isOpen"])
+
+        close_response = {
+            "status": "success",
+            "results": [{
+                "robot_id": 0,
+                "action": "CloseObject",
+                "success": True,
+                "inventory": [],
+                "interacted_objects": [{
+                    "id": fridge_id,
+                    "after": {"id": fridge_id, "type": "Fridge", "isOpen": False},
+                }],
+            }],
+        }
+        merge_execute_result_into_observation(observation, close_response)
+        self.assertFalse(observation["objects"][0]["isOpen"])
+        self.assertTrue(object_state_step_already_satisfied(
+            {"action": "CloseObject", "objectType": "Fridge"}, observation
+        ))
+
+    def test_close_satisfaction_uses_chain_executor_instead_of_stale_peer(self) -> None:
+        current_executor = {
+            "agent_id": "robot_0",
+            "robot_id": 0,
+            "objects": [{"id": "Fridge|1", "type": "Fridge", "visible": True, "openable": True, "isOpen": True}],
+        }
+        stale_peer = {
+            "agent_id": "robot_1",
+            "robot_id": 1,
+            "objects": [{"id": "Fridge|1", "type": "Fridge", "visible": True, "openable": True, "isOpen": False}],
+        }
+
+        satisfied = already_satisfied_observation_for_step(
+            {"action": "CloseObject", "objectType": "Fridge"},
+            [current_executor, stale_peer],
+            primary_robot_id=0,
+            preferred_observation=current_executor,
+        )
+
+        self.assertIsNone(satisfied)
+
+    def test_extracts_observation_from_execute_actions_response(self) -> None:
+        observations = extract_agent_observations(
+            {
+                "status": "success",
+                "results": [
+                    {
+                        "robot_id": 0,
+                        "image_base64": "eA==",
+                        "inventory": [{"objectId": "Tomato|1", "objectType": "Tomato"}],
+                        "held_object": {"objectId": "Tomato|1", "objectType": "Tomato"},
+                    }
+                ],
+                "state": {
+                    "selected_robot_id": 0,
+                    "robots": [
+                        {"robot_id": 0, "held_object": {"objectId": "Tomato|1", "objectType": "Tomato"}}
+                    ],
+                    "objects": [{"id": "Tomato|1", "type": "Tomato", "visible": True, "pickupable": True}],
+                },
+            },
+            primary_robot_id=0,
+        )
+
+        self.assertEqual(observations[0]["robot_id"], 0)
+        self.assertEqual(held_object_type_from_observation(observations[0]), "Tomato")
+        self.assertEqual(observations[0]["image_base64"], "eA==")
+
+    def test_execute_actions_inventory_is_filtered_by_robot_id(self) -> None:
+        observations = extract_agent_observations(
+            {
+                "status": "success",
+                "results": [
+                    {
+                        "robot_id": 0,
+                        "inventory": [{"objectId": "TomatoSliced|1", "objectType": "TomatoSliced"}],
+                        "held_object": {"objectId": "TomatoSliced|1", "objectType": "TomatoSliced"},
+                    },
+                    {
+                        "robot_id": 1,
+                        "inventory": [{"objectId": "Pan|1", "objectType": "Pan"}],
+                        "held_object": {"objectId": "Pan|1", "objectType": "Pan"},
+                    },
+                ],
+                "state": {
+                    "selected_robot_id": 0,
+                    "robots": [
+                        {"robot_id": 0, "held_object": {"objectId": "TomatoSliced|1", "objectType": "TomatoSliced"}},
+                        {"robot_id": 1, "held_object": {"objectId": "Pan|1", "objectType": "Pan"}},
+                    ],
+                    "objects": [
+                        {"id": "TomatoSliced|1", "type": "TomatoSliced", "visible": True, "pickupable": True},
+                        {"id": "Pan|1", "type": "Pan", "visible": True, "pickupable": True},
+                    ],
+                },
+            },
+            primary_robot_id=0,
+        )
+
+        self.assertEqual(observations[0]["robot_id"], 0)
+        self.assertEqual(held_object_type_from_observation(observations[0]), "TomatoSliced")
+
+    def test_merge_execute_result_ignores_other_robot_inventory(self) -> None:
+        observation = {
+            "agent_id": "robot_0",
+            "robot_id": 0,
+            "objects": [{"id": "CounterTop|1", "type": "CounterTop", "visible": True, "receptacle": True}],
+            "inventory": [],
+            "robot_state": {"robot_id": 0},
+        }
+        execute_response = {
+            "status": "success",
+            "results": [
+                {
+                    "robot_id": 1,
+                    "inventory": [{"objectId": "Pan|1", "objectType": "Pan"}],
+                    "held_object": {"objectId": "Pan|1", "objectType": "Pan"},
+                },
+                {
+                    "robot_id": 0,
+                    "inventory": [{"objectId": "TomatoSliced|1", "objectType": "TomatoSliced"}],
+                    "held_object": {"objectId": "TomatoSliced|1", "objectType": "TomatoSliced"},
+                    "robot": {
+                        "robot_id": 0,
+                        "held_object": {"objectId": "TomatoSliced|1", "objectType": "TomatoSliced"},
+                        "inventory": [{"objectId": "TomatoSliced|1", "objectType": "TomatoSliced"}],
+                    },
+                },
+            ],
+        }
+
+        merge_execute_result_into_observation(observation, execute_response)
+
+        self.assertEqual(held_object_type_from_observation(observation), "TomatoSliced")
+
+    def test_held_object_debug_reports_sources(self) -> None:
+        observation = {
+            "agent_id": "robot_0",
+            "robot_id": 0,
+            "inventory": [{"objectId": "TomatoSliced|1", "objectType": "TomatoSliced"}],
+            "robot_state": {
+                "robot_id": 0,
+                "held_object": {"objectId": "TomatoSliced|1", "objectType": "TomatoSliced"},
+                "inventory": [{"objectId": "TomatoSliced|1", "objectType": "TomatoSliced"}],
+                "proxy": None,
+            },
+        }
+
+        debug = held_object_debug_from_observation(observation)
+
+        self.assertEqual(debug["agent_id"], "robot_0")
+        self.assertEqual(debug["robot_id"], 0)
+        self.assertEqual(debug["held_object_type"], "TomatoSliced")
+        self.assertEqual(debug["held_object_source"], "robot_state.held_object")
+        self.assertEqual(debug["robot_state_held_object"]["objectType"], "TomatoSliced")
+
+    def test_rejects_pickup_when_robot_already_holding_object(self) -> None:
+        semantic_plan = {"plan": [{"action": "PickupObject", "objectType": "Apple", "targetType": None}]}
+        observation = {
+            "robot_id": 0,
+            "objects": [{"id": "Apple|1", "type": "Apple", "visible": True, "pickupable": True}],
+            "inventory": [{"objectId": "Tomato|1", "objectType": "Tomato"}],
+            "held_object": {"objectId": "Tomato|1", "objectType": "Tomato"},
+        }
+
+        with self.assertRaisesRegex(ValueError, "already holding Tomato.*PickupObject"):
+            validate_action_state_preconditions(semantic_plan, observation, allow_invisible=False)
+
+    def test_rejects_put_when_robot_hand_is_empty(self) -> None:
+        semantic_plan = {"plan": [{"action": "PutObject", "objectType": "Tomato", "targetType": "CounterTop"}]}
+        observation = {
+            "robot_id": 0,
+            "objects": [{"id": "CounterTop|1", "type": "CounterTop", "visible": True, "receptacle": True}],
+            "inventory": [],
+        }
+
+        with self.assertRaisesRegex(ValueError, "not holding any object.*PutObject"):
+            validate_action_state_preconditions(semantic_plan, observation, allow_invisible=False)
+
+
+    def test_allows_put_when_robot_holds_matching_object(self) -> None:
+        semantic_plan = {"plan": [{"action": "PutObject", "objectType": "Tomato", "targetType": "CounterTop"}]}
+        observation = {
+            "robot_id": 0,
+            "objects": [{"id": "CounterTop|1", "type": "CounterTop", "visible": True, "receptacle": True}],
+            "inventory": [{"objectId": "Tomato|1", "objectType": "Tomato"}],
+            "held_object": {"objectId": "Tomato|1", "objectType": "Tomato"},
+        }
+
+        self.assertIsNone(validate_action_state_preconditions(semantic_plan, observation, allow_invisible=False))
+
+    def test_repairs_redundant_pickup_before_put_when_already_holding_object(self) -> None:
+        task_intent = {
+            "intentSteps": [
+                {"order": 1, "action": "PutObject", "objectType": "Tomato", "targetType": "CounterTop"}
+            ]
+        }
+        semantic_plan = {
+            "plan": [
+                {"action": "PickupObject", "objectType": "Tomato", "targetType": None},
+                {"action": "PutObject", "objectType": "Tomato", "targetType": "CounterTop"},
+            ]
+        }
+        observation = {
+            "robot_id": 0,
+            "objects": [
+                {"id": "Tomato|1", "type": "Tomato", "visible": True, "pickupable": True},
+                {"id": "CounterTop|1", "type": "CounterTop", "visible": True, "receptacle": True},
+            ],
+            "inventory": [{"objectId": "Tomato|1", "objectType": "Tomato"}],
+            "held_object": {"objectId": "Tomato|1", "objectType": "Tomato"},
+        }
+
+        warnings = repair_redundant_pickup_for_held_put(semantic_plan, task_intent, observation)
+
+        self.assertEqual(
+            semantic_plan["plan"],
+            [{"action": "PutObject", "objectType": "Tomato", "targetType": "CounterTop"}],
+        )
+        self.assertIn("removed redundant PickupObject", warnings[0])
+        self.assertIsNone(validate_action_state_preconditions(semantic_plan, observation, allow_invisible=False))
+
+    def test_rejects_put_when_robot_holds_different_object(self) -> None:
+        semantic_plan = {"plan": [{"action": "PutObject", "objectType": "Apple", "targetType": "CounterTop"}]}
+        observation = {
+            "robot_id": 0,
+            "objects": [{"id": "CounterTop|1", "type": "CounterTop", "visible": True, "receptacle": True}],
+            "inventory": [{"objectId": "Tomato|1", "objectType": "Tomato"}],
+            "held_object": {"objectId": "Tomato|1", "objectType": "Tomato"},
+        }
+
+        with self.assertRaisesRegex(ValueError, "holding Tomato, not Apple.*PutObject"):
+            validate_action_state_preconditions(semantic_plan, observation, allow_invisible=False)
+
+    def test_expands_put_intent_with_pickup_when_robot_hand_is_empty(self) -> None:
+        task_intent = {
+            "requestedAction": "PutObject",
+            "requestedObjectType": "TomatoSliced",
+            "intentSteps": [
+                {"order": 1, "action": "PutObject", "objectType": "TomatoSliced", "targetType": "CounterTop"}
+            ],
+        }
+        observation = {
+            "robot_id": 0,
+            "objects": [
+                {"id": "TomatoSliced|1", "type": "TomatoSliced", "visible": True, "pickupable": True},
+                {"id": "CounterTop|1", "type": "CounterTop", "visible": True, "receptacle": True},
+            ],
+            "inventory": [],
+        }
+
+        warnings = expand_put_object_intent_preconditions(task_intent, observation)
+
+        self.assertEqual(
+            task_intent["intentSteps"],
+            [
+                {"order": 1, "action": "PickupObject", "objectType": "TomatoSliced", "targetType": None},
+                {"order": 2, "action": "PutObject", "objectType": "TomatoSliced", "targetType": "CounterTop"},
+            ],
+        )
+        self.assertIn("canonicalized PutObject", warnings[0])
+
+    def test_expands_put_intent_with_open_for_closed_receptacle(self) -> None:
+        task_intent = {
+            "requestedAction": "PutObject",
+            "requestedObjectType": "TomatoSliced",
+            "intentSteps": [
+                {"order": 1, "action": "PutObject", "objectType": "TomatoSliced", "targetType": "Drawer"}
+            ],
+        }
+        observation = {
+            "robot_id": 0,
+            "objects": [
+                {"id": "TomatoSliced|1", "type": "TomatoSliced", "visible": True, "pickupable": True},
+                {"id": "Drawer|1", "type": "Drawer", "visible": True, "receptacle": True, "openable": True, "isOpen": False},
+            ],
+            "inventory": [],
+        }
+
+        expand_put_object_intent_preconditions(task_intent, observation)
+
+        self.assertEqual(
+            task_intent["intentSteps"],
+            [
+                {"order": 1, "action": "PickupObject", "objectType": "TomatoSliced", "targetType": None},
+                {"order": 2, "action": "OpenObject", "objectType": "Drawer", "targetType": None},
+                {"order": 3, "action": "PutObject", "objectType": "TomatoSliced", "targetType": "Drawer"},
+                {"order": 4, "action": "CloseObject", "objectType": "Drawer", "targetType": None},
+            ],
+        )
+
+    def test_put_intent_does_not_pickup_when_robot_already_holds_object(self) -> None:
+        task_intent = {
+            "requestedAction": "PutObject",
+            "requestedObjectType": "TomatoSliced",
+            "intentSteps": [
+                {"order": 1, "action": "PutObject", "objectType": "TomatoSliced", "targetType": "CounterTop"}
+            ],
+        }
+        observation = {
+            "robot_id": 0,
+            "objects": [{"id": "CounterTop|1", "type": "CounterTop", "visible": True, "receptacle": True}],
+            "inventory": [{"objectId": "TomatoSliced|1", "objectType": "TomatoSliced"}],
+            "held_object": {"objectId": "TomatoSliced|1", "objectType": "TomatoSliced"},
+        }
+
+        warnings = expand_put_object_intent_preconditions(task_intent, observation)
+
+        self.assertEqual(
+            task_intent["intentSteps"],
+            [{"order": 1, "action": "PutObject", "objectType": "TomatoSliced", "targetType": "CounterTop"}],
+        )
+        self.assertEqual(warnings, [])
+
+    def test_put_intent_does_not_open_receptacle_that_is_already_open(self) -> None:
+        task_intent = {
+            "requestedAction": "PutObject",
+            "requestedObjectType": "TomatoSliced",
+            "intentSteps": [
+                {"order": 1, "action": "PutObject", "objectType": "TomatoSliced", "targetType": "Drawer"}
+            ],
+        }
+        observation = {
+            "robot_id": 0,
+            "objects": [
+                {"id": "Drawer|1", "type": "Drawer", "visible": True, "receptacle": True, "openable": True, "isOpen": True}
+            ],
+            "inventory": [{"objectId": "TomatoSliced|1", "objectType": "TomatoSliced"}],
+            "held_object": {"objectId": "TomatoSliced|1", "objectType": "TomatoSliced"},
+        }
+
+        expand_put_object_intent_preconditions(task_intent, observation)
+
+        self.assertEqual(
+            task_intent["intentSteps"],
+            [
+                {"order": 1, "action": "PutObject", "objectType": "TomatoSliced", "targetType": "Drawer"},
+                {"order": 2, "action": "CloseObject", "objectType": "Drawer", "targetType": None},
+            ],
+        )
+
+    def test_expands_bad_order_put_intent_to_item_first_then_close_target(self) -> None:
+        task_intent = {
+            "requestedAction": "GotoObject",
+            "requestedObjectType": "Fridge",
+            "requestedTargetType": "Fridge",
+            "intentSteps": [
+                {"order": 1, "action": "GotoObject", "objectType": "Fridge", "targetType": None},
+                {"order": 2, "action": "OpenObject", "objectType": "Fridge", "targetType": None},
+                {"order": 3, "action": "PickupObject", "objectType": "Bread", "targetType": None},
+                {"order": 4, "action": "PutObject", "objectType": "Bread", "targetType": "Fridge"},
+            ],
+        }
+        observation = {
+            "robot_id": 0,
+            "objects": [
+                {"id": "Bread|1", "type": "Bread", "visible": True, "pickupable": True},
+                {"id": "Fridge|1", "type": "Fridge", "visible": True, "receptacle": True, "openable": True, "isOpen": False},
+            ],
+            "inventory": [],
+        }
+
+        warnings = expand_put_object_intent_preconditions(task_intent, observation)
+
+        self.assertEqual(
+            task_intent["intentSteps"],
+            [
+                {"order": 1, "action": "GotoObject", "objectType": "Bread", "targetType": None},
+                {"order": 2, "action": "PickupObject", "objectType": "Bread", "targetType": None},
+                {"order": 3, "action": "GotoObject", "objectType": "Fridge", "targetType": None},
+                {"order": 4, "action": "OpenObject", "objectType": "Fridge", "targetType": None},
+                {"order": 5, "action": "PutObject", "objectType": "Bread", "targetType": "Fridge"},
+                {"order": 6, "action": "CloseObject", "objectType": "Fridge", "targetType": None},
+            ],
+        )
+        self.assertEqual(task_intent["requestedAction"], "GotoObject")
+        self.assertEqual(task_intent["requestedObjectType"], "Bread")
+        self.assertEqual(task_intent["requestedTargetType"], "Fridge")
+        self.assertIn("canonicalized PutObject", warnings[0])
+
+    def test_closed_loop_goto_step_uses_explicit_robot_id(self) -> None:
+        args = SimpleNamespace(
+            primary_robot_id=0,
+            dry_run=False,
+            goto_max_actions=None,
+            goto_min_distance=None,
+            goto_max_distance=None,
+            goto_endpoint="/goto",
+            send_timeout=2.0,
+            print_raw_output=False,
+        )
+        captured = {}
+        old_post_json = auto_scene_actions_module.post_json
+
+        def fake_post_json(url, payload, timeout):
+            captured.update({"url": url, "payload": payload, "timeout": timeout})
+            return {
+                "status": "success",
+                "actions": [],
+                "path": [],
+                "post_target_visible": True,
+                "post_target_object_id": "Fridge|1",
+            }
+
+        auto_scene_actions_module.post_json = fake_post_json
+        try:
+            _, failure = auto_scene_actions_module.execute_closed_loop_goto_step(
+                args,
+                task_id="task-1",
+                base_url="http://127.0.0.1:19000",
+                step_index=3,
+                step={"action": "GotoObject", "objectType": "Fridge", "targetType": None},
+                robot_id=1,
+            )
+        finally:
+            auto_scene_actions_module.post_json = old_post_json
+
+        self.assertEqual(failure, {})
+        self.assertEqual(captured["payload"]["robot_id"], 1)
+        self.assertTrue(captured["payload"]["execute"])
+
+    def test_pickup_step_is_satisfied_when_executor_already_holds_object(self) -> None:
+        step = {"order": 1, "action": "PickupObject", "objectType": "TomatoSliced", "targetType": None}
+        observation = {
+            "agent_id": "robot_0",
+            "robot_id": 0,
+            "objects": [],
+            "inventory": [{"objectId": "TomatoSliced|1", "objectType": "TomatoSliced"}],
+            "held_object": {"objectId": "TomatoSliced|1", "objectType": "TomatoSliced"},
+        }
+
+        self.assertTrue(pickup_step_already_satisfied(step, observation))
+
+    def test_open_close_step_is_satisfied_when_object_state_already_matches(self) -> None:
+        observation = {
+            "agent_id": "robot_0",
+            "robot_id": 0,
+            "objects": [
+                {"id": "Cabinet|1", "type": "Cabinet", "visible": True, "openable": True, "isOpen": True},
+                {"id": "Drawer|1", "type": "Drawer", "visible": True, "openable": True, "isOpen": False},
+            ],
+        }
+
+        self.assertTrue(object_state_step_already_satisfied({"action": "OpenObject", "objectType": "Cabinet"}, observation))
+        self.assertTrue(object_state_step_already_satisfied({"action": "CloseObject", "objectType": "Drawer"}, observation))
+        self.assertFalse(object_state_step_already_satisfied({"action": "OpenObject", "objectType": "Drawer"}, observation))
+
+    def test_prunes_generated_open_and_pickup_when_state_is_already_satisfied(self) -> None:
+        semantic_plan = {
+            "plan": [
+                {"action": "OpenObject", "objectType": "Fridge", "targetType": None},
+                {"action": "PickupObject", "objectType": "Bread", "targetType": None},
+                {"action": "PutObject", "objectType": "Bread", "targetType": "Fridge"},
+            ]
+        }
+        observation = {
+            "robot_id": 0,
+            "objects": [
+                {"id": "Fridge|1", "type": "Fridge", "visible": True, "openable": True, "receptacle": True, "isOpen": True},
+            ],
+            "inventory": [{"objectId": "Bread|1", "objectType": "Bread"}],
+            "held_object": {"objectId": "Bread|1", "objectType": "Bread"},
+        }
+
+        warnings = prune_already_satisfied_semantic_steps(semantic_plan, observation)
+
+        self.assertEqual(
+            semantic_plan["plan"],
+            [{"action": "PutObject", "objectType": "Bread", "targetType": "Fridge"}],
+        )
+        self.assertEqual(len(warnings), 2)
+        self.assertIsNone(validate_action_state_preconditions(semantic_plan, observation, allow_invisible=False))
+
+    def test_invalid_qwen_semantic_output_falls_back_to_validated_intent(self) -> None:
+        class TruncatedBackend:
+            def generate(self, *args, **kwargs):
+                return '{"task": "pick up the lettuce", "plan": ['
+
+        args = SimpleNamespace(
+            task="pick up the lettuce.",
+            _task_intent={
+                "requestedAction": "PickupObject",
+                "requestedObjectType": "Lettuce",
+                "intentSteps": [
+                    {"order": 1, "action": "PickupObject", "objectType": "Lettuce", "targetType": None}
+                ],
+            },
+            _qwen_backend=TruncatedBackend(),
+            print_raw_output=False,
+            save_raw_output=False,
+        )
+
+        _, semantic_plan, raw_path = generate_semantic_plan(
+            args,
+            Path("/tmp/not-used.jpg"),
+            [{"id": "Lettuce|1", "type": "Lettuce", "visible": True, "pickupable": True}],
+            "truncated",
+        )
+
+        self.assertIsNone(raw_path)
+        self.assertTrue(semantic_plan["semanticFallbackUsed"])
+        self.assertEqual(
+            semantic_plan["plan"],
+            [{"action": "PickupObject", "objectType": "Lettuce", "targetType": None}],
+        )
+
+    def test_put_executor_can_be_selected_by_held_object_when_not_visible(self) -> None:
+        observations = [
+            {"agent_id": "robot_2", "robot_id": 2, "is_primary": True, "objects": [], "inventory": []},
+            {
+                "agent_id": "robot_0",
+                "robot_id": 0,
+                "is_primary": False,
+                "objects": [
+                    {"id": "CounterTop|1", "type": "CounterTop", "visible": True, "receptacle": True}
+                ],
+                "inventory": [{"objectId": "TomatoSliced|1", "objectType": "TomatoSliced"}],
+                "held_object": {"objectId": "TomatoSliced|1", "objectType": "TomatoSliced"},
+            },
+        ]
+        visibility_map = build_object_visibility_map(observations)
+        semantic_plan = {
+            "targetObjectType": "TomatoSliced",
+            "plan": [{"action": "PutObject", "objectType": "TomatoSliced", "targetType": "CounterTop"}],
+        }
+        task_intent = {
+            "requestedAction": "PutObject",
+            "requestedObjectType": "TomatoSliced",
+            "intentSteps": [
+                {"order": 1, "action": "PutObject", "objectType": "TomatoSliced", "targetType": "CounterTop"}
+            ],
+        }
+
+        result = choose_relay_executor(
+            "put the tomatosliced on the counter",
+            semantic_plan,
+            visibility_map,
+            observations,
+            task_intent,
+        )
+
+        self.assertEqual(result["status"], "executor_selected")
+        self.assertEqual(result["executor_agent_id"], "robot_0")
+        self.assertIn("already held", result["reason"])
+
+    def test_put_executor_reports_target_receptacle_not_visible_for_holder(self) -> None:
+        observations = [
+            {"agent_id": "robot_2", "robot_id": 2, "is_primary": True, "objects": [], "inventory": []},
+            {
+                "agent_id": "robot_0",
+                "robot_id": 0,
+                "is_primary": False,
+                "objects": [],
+                "inventory": [{"objectId": "TomatoSliced|1", "objectType": "TomatoSliced"}],
+                "held_object": {"objectId": "TomatoSliced|1", "objectType": "TomatoSliced"},
+            },
+        ]
+        visibility_map = build_object_visibility_map(observations)
+        semantic_plan = {
+            "targetObjectType": "TomatoSliced",
+            "plan": [{"action": "PutObject", "objectType": "TomatoSliced", "targetType": "CounterTop"}],
+        }
+        task_intent = {
+            "requestedAction": "PutObject",
+            "requestedObjectType": "TomatoSliced",
+            "intentSteps": [
+                {"order": 1, "action": "PutObject", "objectType": "TomatoSliced", "targetType": "CounterTop"}
+            ],
+        }
+
+        result = choose_relay_executor(
+            "put the tomatosliced on the counter",
+            semantic_plan,
+            visibility_map,
+            observations,
+            task_intent,
+        )
+
+        self.assertEqual(result["status"], "needs_upstream_planning")
+        self.assertEqual(result["failure_code"], "target_not_visible")
+        self.assertEqual(result["failed_object_type"], "CounterTop")
+        self.assertEqual(result["recovery_target_type"], "CounterTop")
+        self.assertIn("target receptacle 'CounterTop' is not visible to robot 0", result["reason"])
+
+    def test_choose_relay_executor_selects_nearest_visible_candidate(self) -> None:
+        observations = [
+            {
+                "agent_id": "robot_0",
+                "robot_id": 0,
+                "is_primary": True,
+                "robot_state": {"position": {"x": 10, "y": 0, "z": 0}},
+                "objects": [{"id": "Apple|1", "type": "Apple", "visible": True, "pickupable": True, "position": {"x": 0, "y": 0, "z": 0}}],
+            },
+            {
+                "agent_id": "robot_1",
+                "robot_id": 1,
+                "is_primary": False,
+                "robot_state": {"position": {"x": 1, "y": 0, "z": 0}},
+                "objects": [{"id": "Apple|1", "type": "Apple", "visible": True, "pickupable": True, "position": {"x": 0, "y": 0, "z": 0}}],
+            },
+            {
+                "agent_id": "robot_2",
+                "robot_id": 2,
+                "is_primary": False,
+                "robot_state": {"position": {"x": 3, "y": 0, "z": 0}},
+                "objects": [{"id": "Apple|1", "type": "Apple", "visible": True, "pickupable": True, "position": {"x": 0, "y": 0, "z": 0}}],
+            },
+        ]
+        semantic_plan = {"targetObjectType": "Apple", "plan": [{"action": "PickupObject", "objectType": "Apple"}]}
+
+        result = choose_relay_executor("pick up the apple", semantic_plan, build_object_visibility_map(observations), observations)
+
+        self.assertEqual(result["status"], "executor_selected")
+        self.assertEqual(result["executor_robot_id"], 1)
+        self.assertEqual(result["candidate_executor_robot_ids"], [1, 2, 0])
+        self.assertEqual(result["selected_distance_to_target"], 1.0)
+        self.assertIn("closest", result["reason"])
+
+    def test_choose_relay_executor_skips_nearest_candidate_that_fails_validation(self) -> None:
+        observations = [
+            {
+                "agent_id": "robot_0",
+                "robot_id": 0,
+                "is_primary": True,
+                "robot_state": {"position": {"x": 10, "y": 0, "z": 0}},
+                "objects": [],
+            },
+            {
+                "agent_id": "robot_1",
+                "robot_id": 1,
+                "is_primary": False,
+                "robot_state": {"position": {"x": 1, "y": 0, "z": 0}},
+                "objects": [{"id": "Apple|1", "type": "Apple", "visible": True, "pickupable": False, "position": {"x": 0, "y": 0, "z": 0}}],
+            },
+            {
+                "agent_id": "robot_2",
+                "robot_id": 2,
+                "is_primary": False,
+                "robot_state": {"position": {"x": 3, "y": 0, "z": 0}},
+                "objects": [{"id": "Apple|1", "type": "Apple", "visible": True, "pickupable": True, "position": {"x": 0, "y": 0, "z": 0}}],
+            },
+        ]
+        semantic_plan = {"targetObjectType": "Apple", "plan": [{"action": "PickupObject", "objectType": "Apple"}]}
+
+        result = choose_relay_executor("pick up the apple", semantic_plan, build_object_visibility_map(observations), observations)
+
+        self.assertEqual(result["status"], "executor_selected")
+        self.assertEqual(result["executor_robot_id"], 2)
+        self.assertFalse(next(item for item in result["candidate_scores"] if item["robot_id"] == 1)["executable"])
+        self.assertEqual(result["candidate_executor_robot_ids"], [2])
+
+    def test_choose_relay_executor_falls_back_to_primary_when_distance_missing(self) -> None:
+        observations = [
+            {
+                "agent_id": "robot_0",
+                "robot_id": 0,
+                "is_primary": True,
+                "objects": [{"id": "Apple|0", "type": "Apple", "visible": True, "pickupable": True}],
+            },
+            {
+                "agent_id": "robot_1",
+                "robot_id": 1,
+                "is_primary": False,
+                "objects": [{"id": "Apple|1", "type": "Apple", "visible": True, "pickupable": True}],
+            },
+        ]
+        semantic_plan = {"targetObjectType": "Apple", "plan": [{"action": "PickupObject", "objectType": "Apple"}]}
+
+        result = choose_relay_executor("pick up the apple", semantic_plan, build_object_visibility_map(observations), observations)
+
+        self.assertEqual(result["status"], "executor_selected")
+        self.assertEqual(result["executor_robot_id"], 0)
+        self.assertIsNone(result["selected_distance_to_target"])
+        self.assertEqual(result["candidate_executor_robot_ids"], [0, 1])
+
+    def test_choose_relay_executor_put_selects_holder_nearest_receptacle(self) -> None:
+        observations = [
+            {
+                "agent_id": "robot_0",
+                "robot_id": 0,
+                "is_primary": True,
+                "robot_state": {"position": {"x": 5, "y": 0, "z": 0}},
+                "objects": [{"id": "CounterTop|1", "type": "CounterTop", "visible": True, "receptacle": True, "position": {"x": 0, "y": 0, "z": 0}}],
+                "inventory": [{"objectId": "Tomato|1", "objectType": "Tomato"}],
+                "held_object": {"objectId": "Tomato|1", "objectType": "Tomato"},
+            },
+            {
+                "agent_id": "robot_2",
+                "robot_id": 2,
+                "is_primary": False,
+                "robot_state": {"position": {"x": 1, "y": 0, "z": 0}},
+                "objects": [{"id": "CounterTop|1", "type": "CounterTop", "visible": True, "receptacle": True, "position": {"x": 0, "y": 0, "z": 0}}],
+                "inventory": [{"objectId": "Tomato|1", "objectType": "Tomato"}],
+                "held_object": {"objectId": "Tomato|1", "objectType": "Tomato"},
+            },
+        ]
+        semantic_plan = {"targetObjectType": "Tomato", "plan": [{"action": "PutObject", "objectType": "Tomato", "targetType": "CounterTop"}]}
+        task_intent = {"requestedAction": "PutObject", "requestedObjectType": "Tomato", "intentSteps": [{"order": 1, "action": "PutObject", "objectType": "Tomato", "targetType": "CounterTop"}]}
+
+        result = choose_relay_executor("put the tomato on the counter", semantic_plan, build_object_visibility_map(observations), observations, task_intent)
+
+        self.assertEqual(result["status"], "executor_selected")
+        self.assertEqual(result["executor_robot_id"], 2)
+        self.assertEqual(result["candidate_executor_robot_ids"], [2, 0])
+        self.assertIn("already held", result["reason"])
+        self.assertIn("closest", result["reason"])
+
+    def test_choose_relay_executor_reports_when_visible_candidates_are_not_executable(self) -> None:
+        observations = [
+            {
+                "agent_id": "robot_0",
+                "robot_id": 0,
+                "is_primary": True,
+                "objects": [{"id": "Apple|1", "type": "Apple", "visible": True, "pickupable": False}],
+            },
+            {
+                "agent_id": "robot_1",
+                "robot_id": 1,
+                "is_primary": False,
+                "objects": [{"id": "Apple|2", "type": "Apple", "visible": True, "pickupable": False}],
+            },
+        ]
+        semantic_plan = {"targetObjectType": "Apple", "plan": [{"action": "PickupObject", "objectType": "Apple"}]}
+
+        result = choose_relay_executor("pick up the apple", semantic_plan, build_object_visibility_map(observations), observations)
+
+        self.assertEqual(result["status"], "needs_upstream_planning")
+        self.assertEqual(result["candidate_executor_robot_ids"], [])
+        self.assertEqual(len(result["candidate_scores"]), 2)
+        self.assertIn("none can execute", result["reason"])
+
+    def test_evaluate_relay_executor_candidates_exposes_nearest_without_selecting(self) -> None:
+        observations = [
+            {
+                "agent_id": "robot_0",
+                "robot_id": 0,
+                "is_primary": True,
+                "robot_state": {"position": {"x": 5, "y": 0, "z": 0}},
+                "objects": [{"id": "Apple|0", "type": "Apple", "visible": True, "pickupable": True, "position": {"x": 0, "y": 0, "z": 0}}],
+            },
+            {
+                "agent_id": "robot_2",
+                "robot_id": 2,
+                "is_primary": False,
+                "robot_state": {"position": {"x": 1, "y": 0, "z": 0}},
+                "objects": [{"id": "Apple|0", "type": "Apple", "visible": True, "pickupable": True, "position": {"x": 0, "y": 0, "z": 0}}],
+            },
+        ]
+        semantic_plan = {"targetObjectType": "Apple", "plan": [{"action": "PickupObject", "objectType": "Apple"}]}
+
+        result = evaluate_relay_executor_candidates(
+            "pick up the apple",
+            semantic_plan,
+            None,
+            build_object_visibility_map(observations),
+            observations,
+            [0, 2],
+            0,
+        )
+
+        self.assertEqual(result["selection_policy"], "llm_tool_calling_with_hard_validation")
+        self.assertEqual(result["candidate_executor_robot_ids"], [2, 0])
+        self.assertEqual(result["candidate_scores"][0]["robot_id"], 2)
+        self.assertEqual(result["candidate_scores"][0]["distance_to_target"], 1.0)
+        self.assertIn("relay agent makes the final executor choice", result["evidence_policy"])
+
+    def test_evaluate_relay_executor_candidates_keeps_failed_nearest_as_evidence(self) -> None:
+        observations = [
+            {
+                "agent_id": "robot_1",
+                "robot_id": 1,
+                "is_primary": False,
+                "robot_state": {"position": {"x": 1, "y": 0, "z": 0}},
+                "objects": [{"id": "Apple|0", "type": "Apple", "visible": True, "pickupable": False, "position": {"x": 0, "y": 0, "z": 0}}],
+            },
+            {
+                "agent_id": "robot_2",
+                "robot_id": 2,
+                "is_primary": False,
+                "robot_state": {"position": {"x": 3, "y": 0, "z": 0}},
+                "objects": [{"id": "Apple|0", "type": "Apple", "visible": True, "pickupable": True, "position": {"x": 0, "y": 0, "z": 0}}],
+            },
+        ]
+        semantic_plan = {"targetObjectType": "Apple", "plan": [{"action": "PickupObject", "objectType": "Apple"}]}
+
+        result = evaluate_relay_executor_candidates(
+            "pick up the apple",
+            semantic_plan,
+            None,
+            build_object_visibility_map(observations),
+            observations,
+            [1, 2],
+            1,
+        )
+
+        self.assertEqual(result["candidate_executor_robot_ids"], [2])
+        failed_nearest = next(item for item in result["candidate_scores"] if item["robot_id"] == 1)
+        self.assertFalse(failed_nearest["executable"])
+        self.assertEqual(failed_nearest["distance_to_target"], 1.0)
+        self.assertIn("pickupable", failed_nearest["validation"])
+
+    def test_put_goal_consistency_allows_held_object_that_is_not_visible(self) -> None:
+        semantic_plan = {
+            "targetObjectType": "TomatoSliced",
+            "plan": [{"action": "PutObject", "objectType": "TomatoSliced", "targetType": "CounterTop"}],
+        }
+        observation = {
+            "agent_id": "robot_0",
+            "robot_id": 0,
+            "objects": [{"id": "CounterTop|1", "type": "CounterTop", "visible": True, "receptacle": True}],
+            "inventory": [{"objectId": "TomatoSliced|1", "objectType": "TomatoSliced"}],
+            "held_object": {"objectId": "TomatoSliced|1", "objectType": "TomatoSliced"},
+        }
+
+        validate_put_object_goal_consistency(semantic_plan, observation)
+
+    def test_put_goal_consistency_rejects_when_object_not_held(self) -> None:
+        semantic_plan = {
+            "targetObjectType": "TomatoSliced",
+            "plan": [{"action": "PutObject", "objectType": "TomatoSliced", "targetType": "CounterTop"}],
+        }
+        observation = {
+            "agent_id": "robot_0",
+            "robot_id": 0,
+            "objects": [{"id": "CounterTop|1", "type": "CounterTop", "visible": True, "receptacle": True}],
+            "inventory": [],
+        }
+
+        with self.assertRaisesRegex(ValueError, "robot 0 is not holding TomatoSliced.*PutObject"):
+            validate_put_object_goal_consistency(semantic_plan, observation)
+
+    def test_executor_validation_allows_put_when_held_object_is_not_visible(self) -> None:
+        semantic_plan = {
+            "targetObjectType": "TomatoSliced",
+            "plan": [{"action": "PutObject", "objectType": "TomatoSliced", "targetType": "CounterTop"}],
+        }
+        observation = {
+            "agent_id": "robot_0",
+            "robot_id": 0,
+            "objects": [{"id": "CounterTop|1", "type": "CounterTop", "visible": True, "receptacle": True}],
+            "inventory": [{"objectId": "TomatoSliced|1", "objectType": "TomatoSliced"}],
+            "held_object": {"objectId": "TomatoSliced|1", "objectType": "TomatoSliced"},
+        }
+        relay_result = {"requested_object_type": "TomatoSliced", "primary_agent_id": "robot_2"}
+
+        failure = validate_executor_plan_or_failure(
+            "put the tomatosliced on the counter",
+            semantic_plan,
+            observation["objects"],
+            allow_invisible=False,
+            relay_result=relay_result,
+            agent_observations=[{"agent_id": "robot_2", "robot_id": 2, "is_primary": True}, observation],
+            task_intent={
+                "requestedAction": "PutObject",
+                "requestedObjectType": "TomatoSliced",
+                "intentSteps": [
+                    {"order": 1, "action": "PutObject", "objectType": "TomatoSliced", "targetType": "CounterTop"}
+                ],
+            },
+            executor_observation=observation,
+        )
+
+        self.assertIsNone(failure)
+
+    def test_executor_validation_allows_put_with_navigation_when_held_object_is_not_visible(self) -> None:
+        semantic_plan = {
+            "targetObjectType": "TomatoSliced",
+            "plan": [
+                {"action": "MoveRight", "objectType": None, "targetType": None},
+                {"action": "PutObject", "objectType": "TomatoSliced", "targetType": "CounterTop"},
+            ],
+        }
+        observation = {
+            "agent_id": "robot_0",
+            "robot_id": 0,
+            "objects": [{"id": "CounterTop|1", "type": "CounterTop", "visible": True, "receptacle": True}],
+            "inventory": [{"objectId": "TomatoSliced|1", "objectType": "TomatoSliced"}],
+            "held_object": {"objectId": "TomatoSliced|1", "objectType": "TomatoSliced"},
+        }
+        relay_result = {"requested_object_type": "TomatoSliced", "primary_agent_id": "robot_2"}
+
+        failure = validate_executor_plan_or_failure(
+            "put the tomatosliced on the counter",
+            semantic_plan,
+            observation["objects"],
+            allow_invisible=False,
+            relay_result=relay_result,
+            agent_observations=[{"agent_id": "robot_2", "robot_id": 2, "is_primary": True}, observation],
+            task_intent={
+                "requestedAction": "PutObject",
+                "requestedObjectType": "TomatoSliced",
+                "intentSteps": [
+                    {"order": 1, "action": "PutObject", "objectType": "TomatoSliced", "targetType": "CounterTop"}
+                ],
+            },
+            executor_observation=observation,
+        )
+
+        self.assertIsNone(failure)
+
+    def test_put_coordination_uses_held_peer_even_when_object_not_visible(self) -> None:
+        observations = [
+            {"agent_id": "robot_2", "robot_id": 2, "is_primary": True, "objects": [], "inventory": []},
+            {
+                "agent_id": "robot_0",
+                "robot_id": 0,
+                "is_primary": False,
+                "objects": [{"id": "CounterTop|1", "type": "CounterTop", "visible": True, "receptacle": True}],
+                "inventory": [{"objectId": "TomatoSliced|1", "objectType": "TomatoSliced"}],
+                "held_object": {"objectId": "TomatoSliced|1", "objectType": "TomatoSliced"},
+            },
+        ]
+        visibility_map = build_object_visibility_map(observations)
+        semantic_plan = {
+            "targetObjectType": "TomatoSliced",
+            "plan": [{"action": "PutObject", "objectType": "TomatoSliced", "targetType": "CounterTop"}],
+        }
+        task_intent = {
+            "requestedAction": "PutObject",
+            "requestedObjectType": "TomatoSliced",
+            "intentSteps": [
+                {"order": 1, "action": "PutObject", "objectType": "TomatoSliced", "targetType": "CounterTop"}
+            ],
+        }
+
+        result = coordination_result_for_plan(
+            "put the tomatosliced on the counter",
+            semantic_plan,
+            visibility_map,
+            task_intent,
+            relay_mode=True,
+        )
+
+        self.assertEqual(result["status"], "target_visible_by_peer")
+        self.assertEqual(result["held_by_agent_ids"], ["robot_0"])
+
+    def test_closed_loop_put_uses_simulated_held_owner(self) -> None:
+        observations = [
+            {"agent_id": "robot_2", "robot_id": 2, "is_primary": True, "objects": [], "inventory": []},
+            {
+                "agent_id": "robot_0",
+                "robot_id": 0,
+                "is_primary": False,
+                "objects": [{"id": "CounterTop|1", "type": "CounterTop", "visible": True, "receptacle": True}],
+                "inventory": [],
+            },
+        ]
+        visibility_map = build_object_visibility_map(observations)
+        step = {"order": 2, "action": "PutObject", "objectType": "TomatoSliced", "targetType": "CounterTop"}
+
+        result = relay_result_for_held_put_step(
+            step,
+            visibility_map,
+            observations,
+            {"robot_0": "TomatoSliced"},
+        )
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result["status"], "executor_selected")
+        self.assertEqual(result["executor_agent_id"], "robot_0")
+
+    def test_closed_loop_put_simulated_holder_keeps_executor_when_target_receptacle_missing(self) -> None:
+        observations = [
+            {"agent_id": "robot_2", "robot_id": 2, "is_primary": True, "objects": [], "inventory": []},
+            {"agent_id": "robot_0", "robot_id": 0, "is_primary": False, "objects": [], "inventory": []},
+        ]
+        visibility_map = build_object_visibility_map(observations)
+        step = {"order": 2, "action": "PutObject", "objectType": "TomatoSliced", "targetType": "CounterTop"}
+
+        result = relay_result_for_held_put_step(
+            step,
+            visibility_map,
+            observations,
+            {"robot_0": "TomatoSliced"},
+        )
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result["status"], "executor_selected")
+        self.assertEqual(result["executor_agent_id"], "robot_0")
+        self.assertEqual(result["recovery_target_type"], "CounterTop")
+        self.assertEqual(result["recovery_robot_id"], 0)
+        self.assertIn("target receptacle 'CounterTop' is not visible to robot 0", result["target_receptacle_visibility_warning"])
+
+    def test_rejects_open_when_object_is_already_open(self) -> None:
+        semantic_plan = {"plan": [{"action": "OpenObject", "objectType": "Fridge", "targetType": None}]}
+        observation = {
+            "objects": [{"id": "Fridge|1", "type": "Fridge", "visible": True, "openable": True, "isOpen": True}],
+            "inventory": [],
+        }
+
+        with self.assertRaisesRegex(ValueError, "already open.*OpenObject"):
+            validate_action_state_preconditions(semantic_plan, observation, allow_invisible=False)
+
+    def test_rejects_close_when_object_is_already_closed(self) -> None:
+        semantic_plan = {"plan": [{"action": "CloseObject", "objectType": "Fridge", "targetType": None}]}
+        observation = {
+            "objects": [{"id": "Fridge|1", "type": "Fridge", "visible": True, "openable": True, "isOpen": False}],
+            "inventory": [],
+        }
+
+        with self.assertRaisesRegex(ValueError, "already closed.*CloseObject"):
+            validate_action_state_preconditions(semantic_plan, observation, allow_invisible=False)
+
+    def test_simulates_state_across_multi_action_plan(self) -> None:
+        semantic_plan = {
+            "plan": [
+                {"action": "PickupObject", "objectType": "Tomato", "targetType": None},
+                {"action": "PutObject", "objectType": "Tomato", "targetType": "CounterTop"},
+            ]
+        }
+        observation = {
+            "objects": [
+                {"id": "Tomato|1", "type": "Tomato", "visible": True, "pickupable": True},
+                {"id": "CounterTop|1", "type": "CounterTop", "visible": True, "receptacle": True},
+            ],
+            "inventory": [],
+        }
+
+        self.assertIsNone(validate_action_state_preconditions(semantic_plan, observation, allow_invisible=False))
+
+
+
+class UnifiedPlanningTest(unittest.TestCase):
+    def test_semantic_prompt_uses_concrete_intent_in_minimal_example(self) -> None:
+        task_intent = {
+            "requestedAction": "PickupObject",
+            "requestedObjectType": "CreditCard",
+            "intentSteps": [
+                {
+                    "order": 1,
+                    "action": "PickupObject",
+                    "objectType": "CreditCard",
+                    "targetType": None,
+                }
+            ],
+        }
+
+        prompt = semantic_planning_prompt(
+            "image",
+            "pick up CreditCard",
+            task_intent=task_intent,
+        )
+
+        self.assertIn('"targetObjectType": "CreditCard"', prompt)
+        self.assertIn('"objectType": "CreditCard"', prompt)
+        self.assertNotIn('"ObjectType"', prompt)
+
+    def test_repairs_only_explicit_semantic_object_placeholder(self) -> None:
+        semantic_plan = {
+            "targetObjectType": "ObjectType",
+            "plan": [
+                {"action": "PickupObject", "objectType": "ObjectType", "targetType": None}
+            ],
+        }
+        step_intent = {
+            "requestedAction": "PickupObject",
+            "requestedObjectType": "CreditCard",
+            "intentSteps": [
+                {
+                    "order": 1,
+                    "action": "PickupObject",
+                    "objectType": "CreditCard",
+                    "targetType": None,
+                }
+            ],
+        }
+
+        warnings = repair_semantic_placeholders_from_step_intent(semantic_plan, step_intent)
+
+        self.assertEqual(semantic_plan["targetObjectType"], "CreditCard")
+        self.assertEqual(semantic_plan["plan"][0]["objectType"], "CreditCard")
+        self.assertEqual(len(warnings), 2)
+
+        wrong_real_type = {
+            "targetObjectType": "Apple",
+            "plan": [{"action": "PickupObject", "objectType": "Apple", "targetType": None}],
+        }
+        self.assertEqual(
+            repair_semantic_placeholders_from_step_intent(wrong_real_type, step_intent),
+            [],
+        )
+        self.assertEqual(wrong_real_type["plan"][0]["objectType"], "Apple")
+
+    def test_native_prompt_declares_plan_without_top_level_actions(self) -> None:
+        prompt = native_planning_prompt("image", "Move the apple")
+        self.assertIn('"plan": [', prompt)
+        self.assertNotIn('"actions":', prompt)
+
+    def test_semantic_rejects_top_level_actions(self) -> None:
+        document = {
+            "task": "move",
+            "needsGrounding": True,
+            "observations": [],
+            "plan": [],
+            "actions": [{"action": "MoveAhead"}],
+        }
+        with self.assertRaisesRegex(ValueError, "top-level"):
+            parse_semantic_planning_output(json.dumps(document))
+
+    def test_semantic_plan_still_validates(self) -> None:
+        document = {
+            "task": "move the apple",
+            "targetObjectType": "Apple",
+            "needsGrounding": True,
+            "observations": [
+                {
+                    "order": 1,
+                    "eventType": "moved_object",
+                    "objectType": "Apple",
+                    "event": "picked up",
+                    "targetType": None,
+                }
+            ],
+            "plan": [
+                {"action": "PickupObject", "objectType": "Apple", "targetType": None}
+            ],
+        }
+        self.assertEqual(parse_semantic_planning_output(json.dumps(document)), document)
+
+    def test_semantic_accepts_target_object_type(self) -> None:
+        document = {
+            "task": "pick up the banana",
+            "targetObjectType": "Banana",
+            "needsGrounding": True,
+            "observations": [],
+            "plan": [{"action": "Done", "objectType": None, "targetType": None}],
+        }
+
+        self.assertEqual(parse_semantic_planning_output(json.dumps(document)), document)
+
+    def test_semantic_normalizes_missing_safe_fields(self) -> None:
+        document = {
+            "task": "pick up the egg",
+            "observations": [
+                {
+                    "order": 1,
+                    "eventType": "moved_object",
+                    "objectType": "Egg",
+                    "event": "picked up",
+                }
+            ],
+            "plan": [{"action": "PickupObject", "objectType": "Egg"}],
+        }
+
+        parsed = parse_semantic_planning_output(json.dumps(document))
+
+        self.assertIs(parsed["needsGrounding"], True)
+        self.assertIsNone(parsed["targetObjectType"])
+        self.assertIsNone(parsed["observations"][0]["targetType"])
+        self.assertIsNone(parsed["plan"][0]["targetType"])
+
+    def test_semantic_normalizes_picked_up_event_type(self) -> None:
+        document = {
+            "task": "pick up the tomato",
+            "targetObjectType": "Tomato",
+            "needsGrounding": True,
+            "observations": [
+                {
+                    "order": 1,
+                    "eventType": "state_changed_object",
+                    "objectType": "Tomato",
+                    "event": "picked up",
+                    "targetType": None,
+                }
+            ],
+            "plan": [{"action": "PickupObject", "objectType": "Tomato", "targetType": None}],
+        }
+
+        parsed = parse_semantic_planning_output(json.dumps(document))
+
+        self.assertEqual(parsed["observations"][0]["eventType"], "moved_object")
+        self.assertIn("semanticNormalizationWarnings", parsed)
+
+    def test_semantic_normalizes_opened_event_type(self) -> None:
+        document = {
+            "task": "open the fridge",
+            "targetObjectType": "Fridge",
+            "needsGrounding": True,
+            "observations": [
+                {
+                    "order": 1,
+                    "eventType": "moved_object",
+                    "objectType": "Fridge",
+                    "event": "opened",
+                    "targetType": None,
+                }
+            ],
+            "plan": [{"action": "OpenObject", "objectType": "Fridge", "targetType": None}],
+        }
+
+        parsed = parse_semantic_planning_output(json.dumps(document))
+
+        self.assertEqual(parsed["observations"][0]["eventType"], "state_changed_object")
+        self.assertIn("semanticNormalizationWarnings", parsed)
+
+    def test_semantic_still_rejects_missing_required_observation_fields(self) -> None:
+        document = {
+            "task": "pick up the egg",
+            "observations": [
+                {
+                    "order": 1,
+                    "eventType": "moved_object",
+                    "event": "picked up",
+                }
+            ],
+            "plan": [{"action": "PickupObject", "objectType": "Egg"}],
+        }
+        with self.assertRaisesRegex(ValueError, "objectType"):
+            parse_semantic_planning_output(json.dumps(document))
+
+    def test_semantic_still_rejects_false_needs_grounding(self) -> None:
+        document = {
+            "task": "pick up the egg",
+            "needsGrounding": False,
+            "observations": [],
+            "plan": [],
+        }
+        with self.assertRaisesRegex(ValueError, "needsGrounding"):
+            parse_semantic_planning_output(json.dumps(document))
+
+    def test_semantic_prompt_shows_required_safe_fields(self) -> None:
+        prompt = semantic_planning_prompt("image", "Pick up the egg")
+        self.assertIn('"needsGrounding": true', prompt)
+        self.assertIn('"targetObjectType": null', prompt)
+        self.assertIn('"targetType": null', prompt)
+        self.assertNotIn('"ObjectType"', prompt)
+        self.assertIn("Never omit needsGrounding, targetObjectType, or targetType", prompt)
+        self.assertIn("Do not replace targetObjectType", prompt)
+        self.assertIn("Use PickupObject only for pickupable small objects", prompt)
+        self.assertIn("Do not replace the user's requested action", prompt)
+        self.assertIn("Use moved_object for pickup/place/put down/push/pull/drop events", prompt)
+        self.assertNotIn('"objectType": "Egg"', prompt)
+
+    def test_semantic_plan_grounds_to_http_actions(self) -> None:
+        semantic_plan = {
+            "plan": [
+                {"action": "PickupObject", "objectType": "Apple", "targetType": None},
+                {"action": "PutObject", "objectType": "Apple", "targetType": "CounterTop"},
+            ]
+        }
+        objects = [
+            {"id": "Apple|1", "type": "Apple", "visible": True, "pickupable": True},
+            {"id": "CounterTop|1", "type": "CounterTop", "visible": True, "receptacle": True},
+        ]
+        self.assertEqual(
+            ground_semantic_plan(semantic_plan, objects, allow_invisible=False, max_actions=20),
+            [
+                {"action": "PickupObject", "objectId": "Apple|1", "forceAction": True},
+                {"action": "PutObject", "objectId": "CounterTop|1", "forceAction": True},
+                {"action": "Done"},
+            ],
+        )
+
+    def test_video_question_remains_natural_language(self) -> None:
+        prompt = question_prompt("What happens next?")
+        self.assertIn("What happens next?", prompt)
+        self.assertNotIn('"plan"', prompt)
+
+
+    def test_structured_pickup_fast_path_skips_qwen_and_selects_nearest_object(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            probe = {
+                "sceneName": "FloorPlan1",
+                "selected_robot_id": 0,
+                "robots": [{"robot_id": 0, "inventory": []}],
+                "objects": [
+                    {
+                        "id": "Tomato|far",
+                        "type": "Tomato",
+                        "visible": True,
+                        "pickupable": True,
+                        "distance": 1.8,
+                    },
+                    {
+                        "id": "Tomato|near",
+                        "type": "Tomato",
+                        "visible": True,
+                        "pickupable": True,
+                        "distance": 0.4,
+                    },
+                ],
+                "image_base64": "eA==",
+            }
+            task_intent_json = json.dumps({
+                "task_intent_source": "upstream_structured_task",
+                "task_intent": {
+                    "requestedAction": "PickupObject",
+                    "requestedObjectType": "Tomato",
+                    "intentSteps": [{
+                        "order": 1,
+                        "action": "PickupObject",
+                        "objectType": "Tomato",
+                        "targetType": None,
+                    }],
+                },
+            })
+
+            class FailingBackend:
+                def generate(self, *args, **kwargs):
+                    raise AssertionError("structured metadata pickup must not call visual Qwen")
+
+                def generate_messages(self, *args, **kwargs):
+                    raise AssertionError("primary fast path must not call relay Qwen")
+
+                def generate_with_tools(self, *args, **kwargs):
+                    raise AssertionError("external task intent must not call task-intent Qwen")
+
+            old_probe = auto_scene_actions_module.probe_scene
+            old_generate = auto_scene_actions_module.generate_semantic_plan
+            old_send = auto_scene_actions_module.send_actions
+            auto_scene_actions_module.probe_scene = lambda *args, **kwargs: probe
+            auto_scene_actions_module.generate_semantic_plan = lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("structured metadata pickup must not generate a semantic plan")
+            )
+            auto_scene_actions_module.send_actions = lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("dry run must not send actions")
+            )
+            try:
+                args = auto_scene_actions_module.parse_args([
+                    "--execute-actions-url",
+                    "http://127.0.0.1:1/execute_actions",
+                    "--task",
+                    "Pick up the tomato.",
+                    "--task-id",
+                    "structured-pickup-1",
+                    "--task-intent-json",
+                    task_intent_json,
+                    "--output-dir",
+                    temp_dir,
+                    "--relay-mode",
+                    "--relay-strategy",
+                    "agent",
+                    "--closed-loop-replan",
+                    "--dry-run",
+                ])
+                args._qwen_backend = FailingBackend()
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(io.StringIO()):
+                    exit_code = auto_scene_actions_module.run(args)
+            finally:
+                auto_scene_actions_module.probe_scene = old_probe
+                auto_scene_actions_module.generate_semantic_plan = old_generate
+                auto_scene_actions_module.send_actions = old_send
+
+        self.assertEqual(exit_code, 0)
+        output = json.loads(stdout.getvalue())
+        trace = output["closed_loop_trace"][0]
+        self.assertEqual(output["closed_loop_result"]["status"], "success")
+        self.assertEqual(
+            trace["actions"],
+            [{"action": "PickupObject", "objectId": "Tomato|near", "forceAction": True}],
+        )
+        self.assertEqual(trace["semantic_plan_source"], "deterministic_structured_pickup")
+        self.assertFalse(trace["visual_model_used"])
+
+    def test_structured_put_step_uses_single_grounded_action_without_helper_close(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            probe = {
+                "sceneName": "FloorPlan1",
+                "selected_robot_id": 0,
+                "robots": [
+                    {
+                        "robot_id": 0,
+                        "inventory": [{"objectId": "Bread|1", "objectType": "Bread"}],
+                        "held_object": {"objectId": "Bread|1", "objectType": "Bread"},
+                    }
+                ],
+                "objects": [
+                    {"id": "Bread|1", "type": "Bread", "visible": False, "pickupable": True},
+                    {"id": "Fridge|1", "type": "Fridge", "visible": True, "receptacle": True, "openable": True, "isOpen": True},
+                ],
+                "image_base64": "eA==",
+            }
+            task_intent_json = json.dumps({
+                "task_intent_source": "upstream_structured_task",
+                "task_intent": {
+                    "requestedAction": "PickupObject",
+                    "requestedObjectType": "Bread",
+                    "requestedTargetType": "Fridge",
+                    "intentSteps": [
+                        {"order": 1, "action": "PickupObject", "objectType": "Bread", "targetType": None, "objectId": "Bread|1"},
+                        {
+                            "order": 2,
+                            "action": "PutObject",
+                            "objectType": "Bread",
+                            "targetType": "Fridge",
+                            "objectId": "Bread|1",
+                            "targetObjectId": "Fridge|1",
+                        },
+                        {"order": 3, "action": "CloseObject", "objectType": "Fridge", "targetType": None, "objectId": "Fridge|1"},
+                    ],
+                },
+            })
+
+            sent_payloads = []
+            old_probe = auto_scene_actions_module.probe_scene
+            old_generate = auto_scene_actions_module.generate_semantic_plan
+            old_send = auto_scene_actions_module.send_actions
+            auto_scene_actions_module.probe_scene = lambda *args, **kwargs: probe
+            auto_scene_actions_module.generate_semantic_plan = lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("upstream structured PutObject must not generate a visual semantic plan")
+            )
+
+            def fake_send(url, payload, timeout):
+                sent_payloads.append(payload)
+                action = payload["actions"][0]["action"]
+                held = [{"objectId": "Bread|1", "objectType": "Bread"}] if action != "PutObject" else []
+                fridge_open = action != "CloseObject"
+                return json.dumps({
+                    "status": "success",
+                    "robot_id": payload.get("robot_id"),
+                    "robot": {
+                        "robot_id": payload.get("robot_id"),
+                        "inventory": held,
+                        "held_object": held[0] if held else None,
+                    },
+                    "objects": [
+                        {"id": "Bread|1", "type": "Bread", "visible": False, "pickupable": True},
+                        {"id": "Fridge|1", "type": "Fridge", "visible": True, "receptacle": True, "openable": True, "isOpen": fridge_open},
+                    ],
+                    "image_base64": "eA==",
+                    "results": [{
+                        "robot_id": payload.get("robot_id"),
+                        "action": action,
+                        "success": True,
+                        "inventory": held,
+                        "held_object": held[0] if held else None,
+                    }],
+                })
+
+            auto_scene_actions_module.send_actions = fake_send
+            try:
+                args = auto_scene_actions_module.parse_args([
+                    "--execute-actions-url",
+                    "http://127.0.0.1:1/execute_actions",
+                    "--task",
+                    "Put the bread in the fridge.",
+                    "--task-id",
+                    "structured-put-fridge",
+                    "--task-intent-json",
+                    task_intent_json,
+                    "--output-dir",
+                    temp_dir,
+                    "--relay-mode",
+                    "--relay-strategy",
+                    "agent",
+                    "--closed-loop-replan",
+                ])
+                args._qwen_backend = object()
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(io.StringIO()):
+                    exit_code = auto_scene_actions_module.run(args)
+            finally:
+                auto_scene_actions_module.probe_scene = old_probe
+                auto_scene_actions_module.generate_semantic_plan = old_generate
+                auto_scene_actions_module.send_actions = old_send
+
+        self.assertEqual(exit_code, 0)
+        output = json.loads(stdout.getvalue())
+        self.assertEqual(output["closed_loop_result"]["status"], "success")
+        action_batches = [payload["actions"] for payload in sent_payloads]
+        self.assertIn([{"action": "PutObject", "objectId": "Fridge|1", "forceAction": True}], action_batches)
+        for actions in action_batches:
+            if actions and actions[0]["action"] == "PutObject":
+                self.assertEqual(actions, [{"action": "PutObject", "objectId": "Fridge|1", "forceAction": True}])
+        self.assertIn([{"action": "CloseObject", "objectId": "Fridge|1", "forceAction": True}], action_batches)
+        self.assertFalse(any(
+            len(actions) > 1 and actions[0].get("action") == "PutObject" and actions[1].get("action") == "CloseObject"
+            for actions in action_batches
+        ))
+
+    def test_structured_pickup_fast_path_rejects_invalid_metadata_or_inventory(self) -> None:
+        args = SimpleNamespace(_task_intent_source="upstream_structured_task")
+        step = {"action": "PickupObject", "objectType": "Mug", "targetType": None}
+        valid_object = {
+            "id": "Mug|1",
+            "type": "Mug",
+            "visible": True,
+            "pickupable": True,
+            "distance": 0.5,
+        }
+
+        self.assertIsNone(
+            auto_scene_actions_module.deterministic_structured_pickup_action(
+                args, step, {"objects": [{**valid_object, "visible": False}], "inventory": []}
+            )
+        )
+        self.assertIsNone(
+            auto_scene_actions_module.deterministic_structured_pickup_action(
+                args, step, {"objects": [{**valid_object, "pickupable": False}], "inventory": []}
+            )
+        )
+        self.assertIsNone(
+            auto_scene_actions_module.deterministic_structured_pickup_action(
+                args,
+                step,
+                {
+                    "objects": [valid_object],
+                    "inventory": [{"objectId": "Plate|1", "objectType": "Plate"}],
+                },
+            )
+        )
+        free_text_args = SimpleNamespace(_task_intent_source="qwen_normalizer_tool_call")
+        self.assertIsNone(
+            auto_scene_actions_module.deterministic_structured_pickup_action(
+                free_text_args, step, {"objects": [valid_object], "inventory": []}
+            )
+        )
+
+    def test_generic_toggle_action_uses_affordance_exact_id_and_force_action(self) -> None:
+        obj = {
+            "id": "SignalBeacon|1", "type": "SignalBeacon", "visible": True,
+            "toggleable": True, "isToggled": True, "distance": 0.4,
+        }
+        step = {
+            "action": "ToggleObjectOff", "objectType": "SignalBeacon",
+            "objectId": "SignalBeacon|1",
+        }
+        actions = ground_semantic_plan(
+            {"plan": [step]}, [obj], allow_invisible=False, max_actions=2, include_done=False,
+        )
+
+        self.assertEqual(
+            actions,
+            [{"action": "ToggleObjectOff", "objectId": "SignalBeacon|1", "forceAction": True}],
+        )
+        self.assertEqual(auto_scene_actions_module.action_object_role("ToggleObjectOff"), "toggleable")
+        self.assertEqual(auto_scene_actions_module.action_object_role("CleanObject"), "dirtyable")
+        self.assertEqual(auto_scene_actions_module.action_object_role("SliceObject"), "sliceable")
+
+    def test_generic_toggle_structured_fast_path_and_state_skip(self) -> None:
+        args = SimpleNamespace(_task_intent_source="upstream_structured_task")
+        obj = {
+            "id": "SignalBeacon|1", "type": "SignalBeacon", "visible": True,
+            "toggleable": True, "isToggled": True, "distance": 0.4,
+        }
+        off_step = {
+            "action": "ToggleObjectOff", "objectType": "SignalBeacon",
+            "objectId": "SignalBeacon|1",
+        }
+
+        self.assertEqual(
+            auto_scene_actions_module.deterministic_structured_interaction_action(
+                args, off_step, {"objects": [obj], "inventory": []},
+            ),
+            {"action": "ToggleObjectOff", "objectId": "SignalBeacon|1", "forceAction": True},
+        )
+        already_off = {"objects": [{**obj, "isToggled": False}]}
+        self.assertTrue(object_state_step_already_satisfied(off_step, already_off))
+        self.assertEqual(extract_requested_action("switch off the signal beacon"), "ToggleObjectOff")
+
+
+class PutObjectFailureClassificationTest(unittest.TestCase):
+    def test_static_placement_precheck_trusts_upstream_structured_goal(self) -> None:
+        step = {
+            "action": "PutObject",
+            "objectType": "SaltShaker",
+            "targetType": "Fridge",
+        }
+
+        self.assertFalse(
+            auto_scene_actions_module.static_placement_contract_rejects_step(
+                SimpleNamespace(_task_intent_source="upstream_structured_task"),
+                step,
+            )
+        )
+        self.assertTrue(
+            auto_scene_actions_module.static_placement_contract_rejects_step(
+                SimpleNamespace(_task_intent_source="model_generated"),
+                step,
+            )
+        )
+
+    def test_controller_failures_map_to_bounded_recovery_strategies(self) -> None:
+        cases = {
+            "Target openable Receptacle is CLOSED, can't place if target is not open!": "receptacle_closed",
+            "Mug cannot be placed in Drawer": "incompatible_receptacle",
+            "Cabinet is full right now": "receptacle_full",
+            "No valid positions to place object found": "no_valid_placement",
+            "target object is not reachable": "target_not_reachable",
+            "unexpected controller failure": "unknown_put_failure",
+        }
+        for error, expected_code in cases.items():
+            with self.subTest(error=error):
+                response = {
+                    "status": "success",
+                    "results": [{"action": "PutObject", "success": False, "error": error}],
+                }
+                classified = auto_scene_actions_module.classify_put_object_failure(response)
+                self.assertEqual(classified["failure_code"], expected_code)
+
+    def test_alternate_receptacle_excludes_failed_instance_and_uses_nearest_visible(self) -> None:
+        objects = [
+            {"id": "Cabinet|failed", "type": "Cabinet", "visible": True, "receptacle": True, "distance": 0.1},
+            {"id": "Cabinet|far", "type": "Cabinet", "visible": True, "receptacle": True, "distance": 2.0},
+            {"id": "Cabinet|near", "type": "Cabinet", "visible": True, "receptacle": True, "distance": 0.5},
+            {"id": "Cabinet|hidden", "type": "Cabinet", "visible": False, "receptacle": True, "distance": 0.2},
+        ]
+        selected = auto_scene_actions_module.alternate_receptacle_for_put(
+            {"targetType": "Cabinet"}, objects, {"Cabinet|failed"}
+        )
+        self.assertEqual(auto_scene_actions_module.object_id_of(selected), "Cabinet|near")
+
+
+
+if __name__ == "__main__":
+    unittest.main()

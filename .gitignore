@@ -1,0 +1,43 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.orig
+*.bak
+*~
+
+# Runtime and recovery artifacts are evidence, not source.
+benchmarkresults/
+planning/datagen/runs/
+recovery_snapshots/
+
+# Local model/cache outputs.
+.cache/
+output/
+outputs/
+
+# Source-only GitHub migration: local data, weights and simulator builds.
+/Qwen2.5-VL-7B-Instruct/
+/Qwen3.5-9B/
+/agents/models/
+/dataset/
+results/
+/memory/database/
+/agents/EmbodiedGPT_Pytorch/datasets/
+/ai2thor/releases/
+/ai2thor/tmp/
+/thor-*.zip
+*.safetensors
+*.pth
+*.pt
+*.ckpt
+*.onnx
+*.egg-info/
+*.so
+build/
+dist/
+.env
+.env.*
+!.env.example
+!.env.template
+/.agents/
+/.codex/

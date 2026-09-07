@@ -1,0 +1,10 @@
+如果服务器开机之后发现codex只亮图标，没有登录或者聊天框界面
+一般来说是因为codex的目录root/.codex被清理掉了，而sb一样的启动程序并没有自动修复机制
+于是这个时候需要聪明的你手动创建.codex文件夹，然后你就惊奇的发现codex开始自动注册了，然后就打开了
+我的建议是干脆不要放在root下面，因为很容易被请掉
+正确的做法是：
+'''
+export CODEX_HOME=/root/.codex
+echo 'export CODEX_HOME=/root/.codex' >> ~/.bashrc
+这样一来环境就自动迁移到了其他目录了
+'''

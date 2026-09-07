@@ -1,0 +1,75 @@
+{
+  "tasks": [
+    {
+      "task_name": "3_put_all_groceries_fridge",
+      "task_description": "Put all groceries in the fridge",
+      "task_id": 17,
+      "task_type": "manipulation",
+      "task_timeout": 40,
+      "task_floorplans": [
+        "FloorPlan1",
+        "FloorPlan2",
+        "FloorPlan3",
+        "FloorPlan4",
+        "FloorPlan5"
+      ]
+    },
+    {
+      "task_name": "3_put_all_shakers_fridge",
+      "task_description": "Put all shakers in the fridge",
+      "task_id": 18,
+      "task_type": "manipulation",
+      "task_timeout": 40,
+      "task_floorplans": [
+        "FloorPlan1",
+        "FloorPlan2",
+        "FloorPlan2",
+        "FloorPlan3",
+        "FloorPlan4",
+        "FloorPlan5"
+      ]
+    },
+    {
+      "task_name": "3_put_all_silverware_drawer",
+      "task_description": "Put all silverware in any drawer",
+      "task_id": 19,
+      "task_type": "manipulation",
+      "task_timeout": 40,
+      "task_floorplans": [
+        "FloorPlan2",
+        "FloorPlan3",
+        "FloorPlan4",
+        "FloorPlan5",
+        "FloorPlan6"
+      ]
+    },
+    {
+      "task_name": "3_put_all_school_supplies_sofa",
+      "task_description": "Put all school supplies in the sofa",
+      "task_id": 20,
+      "task_type": "manipulation",
+      "task_timeout": 40,
+      "task_floorplans": [
+        "FloorPlan201",
+        "FloorPlan202",
+        "FloorPlan203",
+        "FloorPlan209",
+        "FloorPlan212"
+      ]
+    },
+    {
+      "task_name": "3_clear_table_to_sofa",
+      "task_description": "Move everything on the table to the sofa",
+      "task_id": 21,
+      "task_type": "manipulation",
+      "task_timeout": 40,
+      "task_floorplans": [
+        "FloorPlan201",
+        "FloorPlan203",
+        "FloorPlan204",
+        "FloorPlan208",
+        "FloorPlan223"
+      ]
+    }
+  ]
+}

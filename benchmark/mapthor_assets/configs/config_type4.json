@@ -1,0 +1,88 @@
+{
+  "tasks": [
+    {
+      "task_name": "4_clear_table_kitchen",
+      "task_description": "Clear the table by placing items at their appropriate positions",
+      "task_id": 22,
+      "task_type": "transport",
+      "task_timeout": 40,
+      "task_floorplans": [
+        "FloorPlan4",
+        "FloorPlan11",
+        "FloorPlan15",
+        "FloorPlan16",
+        "FloorPlan17"
+      ]
+    },
+    {
+      "task_name": "4_clear_countertop_kitchen",
+      "task_description": "Clear the central countertop by placing items in their appropriate positions",
+      "task_id": 23,
+      "task_type": "transport",
+      "task_timeout": 40,
+      "task_floorplans": [
+        "FloorPlan1",
+        "FloorPlan2",
+        "FloorPlan6",
+        "FloorPlan10",
+        "FloorPlan30"
+      ]
+    },
+    {
+      "task_name": "4_clear_couch_livingroom",
+      "task_description": "Clear the couch by storing the items in their appropriate positions",
+      "task_id": 24,
+      "task_type": "transport",
+      "task_timeout": 40,
+      "task_floorplans": [
+        "FloorPlan201",
+        "FloorPlan202",
+        "FloorPlan203",
+        "FloorPlan209",
+        "FloorPlan212"
+      ]
+    },
+    {
+      "task_name": "4_make_livingroom_dark",
+      "task_description": "Make the living room dark",
+      "task_id": 25,
+      "task_type": "transport",
+      "task_timeout": 40,
+      "task_floorplans": [
+        "FloorPlan201",
+        "FloorPlan202",
+        "FloorPlan203",
+        "FloorPlan204",
+        "FloorPlan205"
+      ]
+    },
+    {
+      "task_name": "4_slice_all_sliceable",
+      "task_description": "Slice all sliceable objects",
+      "task_id": 26,
+      "task_type": "transport",
+      "task_timeout": 40,
+      "task_floorplans": [
+        "FloorPlan1",
+        "FloorPlan2",
+        "FloorPlan3",
+        "FloorPlan4",
+        "FloorPlan5"
+      ]
+    },
+    {
+      "task_name": "4_put_appropriate_storage",
+      "task_description": "Put appropriate utensils in storage",
+      "task_id": 27,
+      "task_type": "transport",
+      "task_timeout": 40,
+      "task_floorplans": [
+        "FloorPlan2",
+        "FloorPlan3",
+        "FloorPlan4",
+        "FloorPlan5",
+        "FloorPlan6"
+      ]
+    }
+  ]
+}

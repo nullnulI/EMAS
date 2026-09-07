@@ -1,0 +1,4 @@
+没有vulkan指令的话，开机后
+sudo apt update
+sudo apt install -y vulkan-tools libvulkan1 mesa-vulkan-drivers
+apt-get install -y libglvnd0 libegl1 libglx0 libopengl0 libvulkan1 vulkan-tools

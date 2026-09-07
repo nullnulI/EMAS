@@ -1,0 +1,108 @@
+{
+  "tasks": [
+    {
+      "task_name": "2_open_all_drawers",
+      "task_description": "Open all the drawers",
+      "task_id": 10,
+      "task_type": "manipulation",
+      "task_timeout": 40,
+      "task_floorplans": [
+        "FloorPlan1",
+        "FloorPlan2",
+        "FloorPlan3",
+        "FloorPlan4",
+        "FloorPlan5",
+        "FloorPlan6",
+        "FloorPlan7",
+        "FloorPlan8",
+        "FloorPlan9"
+      ]
+    },
+
+    {
+      "task_name": "2_open_all_cabinets",
+      "task_description": "Open all the drawers",
+      "task_id": 11,
+      "task_type": "manipulation",
+      "task_timeout": 40,
+      "task_floorplans": [
+        "FloorPlan1",
+        "FloorPlan6",
+        "FloorPlan7",
+        "FloorPlan8",
+        "FloorPlan9",
+        "FloorPlan10"
+      ]
+    },
+
+    {
+      "task_name": "2_turn_on_all_stove_knobs",
+      "task_description": "Turn on all the stove knobs",
+      "task_id": 12,
+      "task_type": "manipulation",
+      "task_timeout": 40,
+      "task_floorplans": [
+        "FloorPlan1",
+        "FloorPlan6",
+        "FloorPlan7",
+        "FloorPlan8",
+        "FloorPlan9",
+        "FloorPlan10"
+      ]
+    },
+
+    {
+      "task_name": "2_put_all_vases_countertop",
+      "task_description": "Put all the vases on the countertop",
+      "task_id": 13,
+      "task_type": "manipulation",
+      "task_timeout": 40,
+      "task_floorplans": [
+        "FloorPlan1",
+        "FloorPlan5"
+      ]
+    },
+
+    {
+      "task_name": "2_put_all_potatoes_bowl",
+      "task_description": "Put all the tomatoes and potatoes in the fridge",
+      "task_id": 14,
+      "task_type": "manipulation",
+      "task_timeout": 40,
+      "task_floorplans": [
+        "FloorPlan1",
+        "FloorPlan5"
+      ]
+    },
+
+    {
+      "task_name": "2_put_all_creditcards_remotecontrols_box",
+      "task_description": "Put all credit cards and remote controls in the box",
+      "task_id": 15,
+      "task_type": "manipulation",
+      "task_timeout": 40,
+      "task_floorplans": [
+        "FloorPlan201",
+        "FloorPlan203",
+        "FloorPlan204",
+        "FloorPlan205"
+      ]
+    },
+
+    {
+      "task_name": "3_put_all_groceries_fridge",
+      "task_description": "Put all groceries in the fridge",
+      "task_id": 16,
+      "task_type": "manipulation",
+      "task_timeout": 50,
+      "task_floorplans": [
+        "FloorPlan1",
+        "FloorPlan2",
+        "FloorPlan3",
+        "FloorPlan4",
+        "FloorPlan5"
+      ]
+    }
+
+  ]
+}
